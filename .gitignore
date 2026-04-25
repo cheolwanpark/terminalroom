@@ -1,0 +1,5 @@
+/target/
+/.terminalroom.db
+*.swp
+*.swo
+.DS_Store
