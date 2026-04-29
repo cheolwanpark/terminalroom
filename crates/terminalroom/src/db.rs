@@ -207,6 +207,7 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::ImageKind;
     use tempfile::TempDir;
 
     fn make_file(path: &str, size: u64, mtime: i64) -> DiscoveredFile {
@@ -217,6 +218,7 @@ mod tests {
             display_name: display,
             size_bytes: size,
             modified_unix_seconds: mtime,
+            kind: ImageKind::Raw,
         }
     }
 

@@ -2,7 +2,7 @@
 
 ## Workspace Shape
 
-The project should start as a Cargo workspace with two crates:
+The project is a Cargo workspace with two crates:
 
 ```text
 terminalroom/
@@ -20,11 +20,17 @@ terminalroom/
         session.rs
         db.rs
         preview.rs
+        app.rs
+        tui/
+          mod.rs
+          culling.rs
+          develop.rs
+          filter.rs
 ```
 
 `libraw-rs` is a library crate. It owns LibRaw linking, bindings, unsafe calls, pointer lifetimes, and conversion into safe Rust image data.
 
-`terminalroom` is a library + binary crate. The library half holds the headless modules (`session`, `db`, `preview`) so they can be unit-tested without a TTY. The binary half is the entry point: CLI parsing, terminal rendering, keyboard input, and view routing.
+`terminalroom` is a library + binary crate. The library half holds the headless modules (`session`, `db`, `preview`, `app`) so they can be unit-tested without a TTY; `tui/` is the only module that depends on ratatui/crossterm. The binary half (`main.rs`) is a thin entry point: CLI parsing, then `App::init` and `tui::run`.
 
 ## Crate Boundary
 
@@ -64,41 +70,57 @@ The exact Rust names can change during implementation, but the boundary should s
 
 ## Application Modules
 
-The headless half of `terminalroom` is split into three modules under `crates/terminalroom/src/`. Each module owns one responsibility and exposes a small surface that the future TUI consumes.
+The headless half of `terminalroom` is split into four modules under `crates/terminalroom/src/`. Each module owns one responsibility and exposes a small surface that the TUI consumes.
 
-- `session` — resolves an input path into a `Session { root, files }`. Single file inputs use the parent directory as session root; directory inputs scan immediate children, filter by RAW extension (case-insensitive), and sort by case-insensitive filename. Provides `fingerprint()` (`<size>:<mtime>`) for change detection.
+- `session` — resolves an input path into a `Session { root, files }`. Single file inputs use the parent directory as session root; directory inputs scan immediate children, filter by image extension (RAW: arw/cr2/cr3/dng/nef/nrw/raf/raw/rw2/orf/pef/srw — plus jpg/jpeg/png/tif/tiff), and sort by case-insensitive filename. Each `DiscoveredFile` carries an `ImageKind` tag (`Raw`, `Jpeg`, `Png`, `Tiff`) so the preview pipeline and filter UI don't have to re-parse extensions. Single-file input rejects unsupported extensions. Provides `fingerprint()` (`<size>:<mtime>`) for change detection.
 - `db` — owns the SQLite connection at `<root>/.terminalroom.db`. Handles `PRAGMA user_version` migrations, `sync_files` upsert (creates default `unset` culling rows; never deletes missing files), and `set_state` for culling state changes. `now_unix` is injected so callers control the clock.
-- `preview` — converts `libraw_rs::PreviewImage` into `image::DynamicImage` for the TUI. JPEG bytes go through `image::load_from_memory_with_format`; packed `Rgb8` 3-channel/8-bit becomes `DynamicImage::ImageRgb8`. Other RGB layouts return `PreviewError::UnsupportedRgb` until a real RAW forces support.
+- `preview` — converts RAW data and on-disk images into `image::DynamicImage` for the TUI. `decode_preview` consumes `libraw_rs::PreviewImage` (JPEG bytes through `image::load_from_memory_with_format`; packed `Rgb8` 3-channel/8-bit through `ImageBuffer`). `load_preview(path, kind)` is the high-level entry point: it routes RAW through `libraw_rs::read_preview` + `decode_preview`, and JPEG/PNG/TIFF through `image::ImageReader::open`.
+- `app` — framework-agnostic state and update logic. Owns the `Db`, the `FileEntry` list, the `visible` index list (after filter), the `enabled_formats` set, and the modal `View` (`Culling`/`Develop`/`Filter`). Methods (`next`, `prev`, `set_state`, `toggle_format`, `open_filter`/`close_filter`, `filter_next`/`filter_prev`, `toggle_current_filter`) are pure state mutations — no I/O beyond DB writes. This makes navigation, filter, and persistence logic unit-testable without touching ratatui.
 
-Each module has unit tests that run without RAW fixtures: `session` uses `tempfile` directories, `db` uses in-memory and temp-file SQLite, `preview` synthesizes JPEG bytes at test time via the `image` crate's encoder.
+The TUI half lives under `crates/terminalroom/src/tui/`:
+
+- `tui::run` — terminal setup with a Drop guard, `Picker::from_query_stdio()` (with halfblocks fallback), an LRU preview cache (capacity 9 keyed by canonical path), and the main poll/draw loop.
+- `tui::culling` — Option B layout: outer vertical split into main area + 1-row status line; inner horizontal split into preview area (left) and filmstrip (right, fixed width). Filmstrip is a `List` of text rows with state badges (`✓`/`✗`/`·`).
+- `tui::develop` — placeholder paragraph.
+- `tui::filter` — modal overlay rendered on top of the culling view: centered `Rect`, `Clear` widget, then a bordered `Block` containing the format list (`[x] JPEG  (12)` rows) and a footer hint.
+
+Each headless module has unit tests that run without RAW fixtures or a TTY: `session` uses `tempfile` directories, `db` uses in-memory and temp-file SQLite, `preview` synthesizes JPEG bytes at test time via the `image` crate's encoder, and `app` exercises navigation/filter/state logic against in-memory DBs.
 
 ## Runtime Flow
 
 1. Parse `terminalroom <path>`.
 2. Resolve the input path.
-3. If the input is a RAW file, use that single file as the session.
-4. If the input is a directory, scan immediate children, filter supported RAW extensions, sort by filename, and use the directory as the session root.
+3. If the input is a single image file, use that file as the session (rejected with an error if the extension is not supported).
+4. If the input is a directory, scan immediate children, filter supported image extensions (RAW + JPEG/PNG/TIFF), sort by filename, and use the directory as the session root.
 5. Open or create `<session-root>/.terminalroom.db`.
 6. Upsert discovered file records.
-7. Start the culling view.
-8. Decode previews on demand and cache them in memory for nearby files.
-9. Persist every culling state change immediately.
-10. Switch to the develop placeholder view when requested.
+7. Build the `App` (zips session files with DB-backed states, computes `available_formats` with per-format counts, seeds `enabled_formats` with all kinds present).
+8. Start the culling view.
+9. Decode previews on demand and cache them in memory (LRU, capacity 9) keyed by canonical path.
+10. Persist every culling state change immediately.
+11. Open the filter popup when `f` is pressed; toggling formats rebuilds the visible list, preserving the current selection by canonical path when possible.
+12. Switch to the develop placeholder view when `d` is requested; `c` returns to culling.
 
 For a single-file session, use the file's parent directory as the session root for `.terminalroom.db`.
 
 ## App State
 
-The app state should stay explicit and small for the first MVP:
+The actual `App` struct (in `crates/terminalroom/src/app.rs`):
 
-- `session_root`: directory containing `.terminalroom.db`.
-- `files`: sorted list of discovered RAW files and their DB-backed culling states.
-- `selected_index`: current file index.
-- `view`: `Culling` or `Develop`.
-- `preview_cache`: bounded in-memory cache keyed by canonical path.
-- `image_protocol_state`: ratatui-image state for the currently rendered image.
+- `session_root: PathBuf` — directory containing `.terminalroom.db`.
+- `files: Vec<FileEntry>` — every discovered file (1:1 with the scan), each with id, `DiscoveredFile`, and `CullingState`.
+- `visible: Vec<usize>` — indices into `files`, after applying the current format filter.
+- `cursor: usize` — index into `visible`.
+- `view: View` — `Culling`, `Develop`, or `Filter`.
+- `enabled_formats: BTreeSet<ImageKind>` — the live filter; mutated by `toggle_format`.
+- `available_formats: Vec<(ImageKind, usize)>` — sorted format list with counts; computed once at init.
+- `filter_cursor: usize` — popup-local row cursor.
+- `status: Option<String>` — transient error/info line for the status bar.
+- `db: Db` — owned SQLite handle for state writes.
 
-Avoid introducing plugin systems, async runtimes, or generalized editing pipelines before the first culling loop works.
+The TUI layer (`tui::run`) owns ratatui-specific state alongside the `App`: the `Picker` and the `LruCache<PathBuf, StatefulProtocol>`. These are intentionally outside `App` so the headless logic stays free of ratatui types.
+
+Avoid introducing plugin systems, async runtimes, or generalized editing pipelines before the develop view becomes real.
 
 ## Preview Loading Strategy
 

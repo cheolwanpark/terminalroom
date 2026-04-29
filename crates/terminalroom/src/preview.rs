@@ -1,13 +1,19 @@
 use std::fmt;
+use std::path::Path;
 
-use image::{DynamicImage, ImageBuffer, ImageFormat, Rgb};
+use image::{DynamicImage, ImageBuffer, ImageFormat, ImageReader, Rgb};
 use libraw_rs::{PreviewFormat, PreviewImage};
+
+use crate::session::ImageKind;
 
 #[derive(Debug)]
 pub enum PreviewError {
     JpegDecode(image::ImageError),
     UnsupportedRgb { colors: u8, bits_per_channel: u8 },
     BufferTooSmall { expected: usize, got: usize },
+    Io(std::io::Error),
+    ImageDecode(image::ImageError),
+    Raw(libraw_rs::Error),
 }
 
 impl fmt::Display for PreviewError {
@@ -25,6 +31,9 @@ impl fmt::Display for PreviewError {
                 f,
                 "preview buffer too small: expected {expected} bytes, got {got}"
             ),
+            Self::Io(e) => write!(f, "failed to read image file: {e}"),
+            Self::ImageDecode(e) => write!(f, "failed to decode image: {e}"),
+            Self::Raw(e) => write!(f, "failed to read RAW preview: {e}"),
         }
     }
 }
@@ -33,8 +42,26 @@ impl std::error::Error for PreviewError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::JpegDecode(e) => Some(e),
+            Self::Io(e) => Some(e),
+            Self::ImageDecode(e) => Some(e),
+            Self::Raw(e) => Some(e),
             _ => None,
         }
+    }
+}
+
+pub fn load_preview(path: &Path, kind: ImageKind) -> Result<DynamicImage, PreviewError> {
+    match kind {
+        ImageKind::Raw => {
+            let preview = libraw_rs::read_preview(path).map_err(PreviewError::Raw)?;
+            decode_preview(preview)
+        }
+        ImageKind::Jpeg | ImageKind::Png | ImageKind::Tiff => ImageReader::open(path)
+            .map_err(PreviewError::Io)?
+            .with_guessed_format()
+            .map_err(PreviewError::Io)?
+            .decode()
+            .map_err(PreviewError::ImageDecode),
     }
 }
 
@@ -199,5 +226,26 @@ mod tests {
         );
         let err = decode_preview(p).unwrap_err();
         assert!(matches!(err, PreviewError::BufferTooSmall { .. }));
+    }
+
+    #[test]
+    fn load_preview_jpeg_from_disk() {
+        let pixels = vec![128u8; 8 * 8 * 3];
+        let jpeg = encode_jpeg_rgb(8, 8, pixels);
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("sample.jpg");
+        std::fs::write(&path, &jpeg).unwrap();
+
+        let img = load_preview(&path, ImageKind::Jpeg).unwrap();
+        assert_eq!(img.dimensions(), (8, 8));
+    }
+
+    #[test]
+    fn load_preview_unsupported_path_errors() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("missing.jpg");
+        let err = load_preview(&path, ImageKind::Jpeg).unwrap_err();
+        assert!(matches!(err, PreviewError::Io(_)));
     }
 }

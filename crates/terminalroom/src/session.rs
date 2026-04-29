@@ -8,6 +8,44 @@ const RAW_EXTENSIONS: &[&str] = &[
     "arw", "cr2", "cr3", "dng", "nef", "nrw", "raf", "raw", "rw2", "orf", "pef", "srw",
 ];
 
+const JPEG_EXTENSIONS: &[&str] = &["jpg", "jpeg"];
+const PNG_EXTENSIONS: &[&str] = &["png"];
+const TIFF_EXTENSIONS: &[&str] = &["tif", "tiff"];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ImageKind {
+    Raw,
+    Jpeg,
+    Png,
+    Tiff,
+}
+
+impl ImageKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Raw => "RAW",
+            Self::Jpeg => "JPEG",
+            Self::Png => "PNG",
+            Self::Tiff => "TIFF",
+        }
+    }
+}
+
+pub fn classify(extension: &str) -> Option<ImageKind> {
+    let lower = extension.to_ascii_lowercase();
+    if RAW_EXTENSIONS.iter().any(|e| *e == lower) {
+        Some(ImageKind::Raw)
+    } else if JPEG_EXTENSIONS.iter().any(|e| *e == lower) {
+        Some(ImageKind::Jpeg)
+    } else if PNG_EXTENSIONS.iter().any(|e| *e == lower) {
+        Some(ImageKind::Png)
+    } else if TIFF_EXTENSIONS.iter().any(|e| *e == lower) {
+        Some(ImageKind::Tiff)
+    } else {
+        None
+    }
+}
+
 #[derive(Debug)]
 pub struct Session {
     pub root: PathBuf,
@@ -20,6 +58,7 @@ pub struct DiscoveredFile {
     pub display_name: String,
     pub size_bytes: u64,
     pub modified_unix_seconds: i64,
+    pub kind: ImageKind,
 }
 
 pub fn discover(input: &Path) -> Result<Session> {
@@ -30,7 +69,10 @@ pub fn discover(input: &Path) -> Result<Session> {
         .with_context(|| format!("failed to stat {}", canonical.display()))?;
 
     if metadata.is_file() {
-        let file = describe(&canonical, &metadata)?;
+        let kind = path_kind(&canonical).ok_or_else(|| {
+            anyhow!("{} is not a supported image format", canonical.display())
+        })?;
+        let file = describe(&canonical, &metadata, kind)?;
         let root = canonical
             .parent()
             .ok_or_else(|| anyhow!("{} has no parent directory", canonical.display()))?
@@ -52,15 +94,15 @@ pub fn discover(input: &Path) -> Result<Session> {
                 continue;
             }
             let path = entry.path();
-            if !has_raw_extension(&path) {
+            let Some(kind) = path_kind(&path) else {
                 continue;
-            }
+            };
             let meta = fs::metadata(&path)
                 .with_context(|| format!("failed to stat {}", path.display()))?;
-            files.push(describe(&path, &meta)?);
+            files.push(describe(&path, &meta, kind)?);
         }
         if files.is_empty() {
-            bail!("no RAW files found in {}", canonical.display());
+            bail!("no image files found in {}", canonical.display());
         }
         files.sort_by(|a, b| {
             a.display_name
@@ -80,7 +122,11 @@ pub fn fingerprint(file: &DiscoveredFile) -> String {
     format!("{}:{}", file.size_bytes, file.modified_unix_seconds)
 }
 
-fn describe(canonical: &Path, metadata: &fs::Metadata) -> Result<DiscoveredFile> {
+fn describe(
+    canonical: &Path,
+    metadata: &fs::Metadata,
+    kind: ImageKind,
+) -> Result<DiscoveredFile> {
     let display_name = canonical
         .file_name()
         .and_then(|n| n.to_str())
@@ -99,17 +145,12 @@ fn describe(canonical: &Path, metadata: &fs::Metadata) -> Result<DiscoveredFile>
         display_name,
         size_bytes,
         modified_unix_seconds,
+        kind,
     })
 }
 
-fn has_raw_extension(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .map(|e| {
-            let lower = e.to_ascii_lowercase();
-            RAW_EXTENSIONS.iter().any(|ext| *ext == lower)
-        })
-        .unwrap_or(false)
+fn path_kind(path: &Path) -> Option<ImageKind> {
+    path.extension().and_then(|e| e.to_str()).and_then(classify)
 }
 
 #[cfg(test)]
@@ -125,22 +166,37 @@ mod tests {
     }
 
     #[test]
+    fn classify_handles_case_and_unknown() {
+        assert_eq!(classify("CR3"), Some(ImageKind::Raw));
+        assert_eq!(classify("cr3"), Some(ImageKind::Raw));
+        assert_eq!(classify("JPG"), Some(ImageKind::Jpeg));
+        assert_eq!(classify("jpeg"), Some(ImageKind::Jpeg));
+        assert_eq!(classify("png"), Some(ImageKind::Png));
+        assert_eq!(classify("TIFF"), Some(ImageKind::Tiff));
+        assert_eq!(classify("tif"), Some(ImageKind::Tiff));
+        assert_eq!(classify("txt"), None);
+        assert_eq!(classify(""), None);
+    }
+
+    #[test]
     fn discover_empty_dir_errors() {
         let tmp = TempDir::new().unwrap();
         let err = discover(tmp.path()).unwrap_err();
         assert!(
-            err.to_string().contains("no RAW files"),
+            err.to_string().contains("no image files"),
             "unexpected error: {err}"
         );
     }
 
     #[test]
-    fn discover_dir_filters_and_sorts_case_insensitively() {
+    fn discover_dir_includes_raw_and_non_raw_filters_unknown() {
         let tmp = TempDir::new().unwrap();
         touch(tmp.path(), "b.NEF");
         touch(tmp.path(), "a.txt");
         touch(tmp.path(), "C.cr3");
         touch(tmp.path(), "d.JPG");
+        touch(tmp.path(), "E.png");
+        touch(tmp.path(), "f.TIFF");
 
         let session = discover(tmp.path()).unwrap();
         let names: Vec<_> = session
@@ -148,25 +204,50 @@ mod tests {
             .iter()
             .map(|f| f.display_name.as_str())
             .collect();
-        assert_eq!(names, vec!["b.NEF", "C.cr3"]);
+        // sorted case-insensitively
+        assert_eq!(names, vec!["b.NEF", "C.cr3", "d.JPG", "E.png", "f.TIFF"]);
+
+        let kinds: Vec<_> = session.files.iter().map(|f| f.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ImageKind::Raw,
+                ImageKind::Raw,
+                ImageKind::Jpeg,
+                ImageKind::Png,
+                ImageKind::Tiff,
+            ]
+        );
     }
 
     #[test]
-    fn discover_single_file_uses_parent_as_root() {
+    fn discover_single_raw_file_uses_parent_as_root() {
         let tmp = TempDir::new().unwrap();
         let file = touch(tmp.path(), "x.cr3");
         let session = discover(&file).unwrap();
         assert_eq!(session.files.len(), 1);
+        assert_eq!(session.files[0].kind, ImageKind::Raw);
         assert_eq!(session.root, tmp.path().canonicalize().unwrap());
     }
 
     #[test]
-    fn discover_single_non_raw_file_is_accepted() {
+    fn discover_single_jpeg_file_is_accepted() {
         let tmp = TempDir::new().unwrap();
-        let file = touch(tmp.path(), "notes.txt");
+        let file = touch(tmp.path(), "x.jpg");
         let session = discover(&file).unwrap();
         assert_eq!(session.files.len(), 1);
-        assert_eq!(session.files[0].display_name, "notes.txt");
+        assert_eq!(session.files[0].kind, ImageKind::Jpeg);
+    }
+
+    #[test]
+    fn discover_single_unsupported_file_errors() {
+        let tmp = TempDir::new().unwrap();
+        let file = touch(tmp.path(), "notes.txt");
+        let err = discover(&file).unwrap_err();
+        assert!(
+            err.to_string().contains("not a supported image format"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -176,6 +257,7 @@ mod tests {
             display_name: "x".into(),
             size_bytes: 42,
             modified_unix_seconds: 1234,
+            kind: ImageKind::Raw,
         };
         assert_eq!(fingerprint(&f), "42:1234");
     }

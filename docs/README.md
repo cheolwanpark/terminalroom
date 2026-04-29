@@ -1,11 +1,11 @@
 # Terminalroom Docs
 
-Terminalroom is planned as a terminal UI for culling and developing RAW images.
-The first milestone is intentionally narrow:
+Terminalroom is a terminal UI for culling and developing photographs. The first milestone:
 
 - Run `terminalroom <path>`.
-- Load RAW files from the target file or directory.
-- Show a culling view with a main image and nearby thumbnails.
+- Load image files (RAW + JPEG/PNG/TIFF) from the target file or directory.
+- Show a culling view with a main preview and a vertical filmstrip on the right.
+- Filter the visible files by format through a modal popup (key `f`).
 - Persist culling decisions in `<path>/.terminalroom.db`.
 - Provide a placeholder develop view.
 
@@ -18,20 +18,22 @@ The first milestone is intentionally narrow:
 
 ## Current Decisions
 
-- Use a Cargo workspace with a `libraw-rs` library crate and a `terminalroom` library + binary crate. The library half exists so headless modules (`session`, `db`, `preview`) can be unit-tested without a TTY.
-- Keep all LibRaw FFI and unsafe code inside `libraw-rs`.
+- Use a Cargo workspace with a `libraw-rs` library crate and a `terminalroom` library + binary crate. The library half holds headless modules (`session`, `db`, `preview`, `app`) so they can be unit-tested without a TTY; `tui/` contains the ratatui rendering and event loop.
+- Keep all LibRaw FFI and unsafe code inside `libraw-rs`. Non-RAW images are loaded directly via the `image` crate, so the FFI boundary stays clean.
 - Use SQLite through `rusqlite` (bundled feature) for `.terminalroom.db`.
-- Use the `image` crate (jpeg-only feature) in the application crate to decode embedded JPEG previews into `DynamicImage`. ratatui-image will consume the same type later.
-- Prefer LibRaw embedded thumbnails for culling previews, with processed RGB as fallback.
+- Use the `image` crate with `jpeg`, `png`, and `tiff` features (no defaults). RAW previews come from LibRaw and are converted into `DynamicImage` via `preview::decode_preview`; non-RAW files go through `image::ImageReader::open`.
+- Prefer LibRaw embedded thumbnails for RAW culling previews, with processed RGB as fallback.
 - Scan only the direct children of a directory for the first MVP. Recursive scanning is deferred.
+- Culling layout: Option B — vertical filmstrip on the right of the main preview (text labels with state badges, no per-row image rendering).
+- Filter is a session-only modal popup. Toggling rebuilds the visible list without rescanning; selection survives toggles when the current file is still visible.
 
 ## Implementation Status
 
 - [x] `libraw-rs` FFI surface and safe wrappers (`read_metadata`, `read_preview`).
-- [x] `session` — file scanning, sort, fingerprint.
+- [x] `session` — file scanning (RAW + JPEG/PNG/TIFF), sort, fingerprint, `ImageKind`.
 - [x] `db` — SQLite v1 schema, migrations, `sync_files`, `set_state`.
-- [x] `preview` — `PreviewImage` → `DynamicImage` adapter.
-- [ ] Culling TUI (ratatui + ratatui-image, event loop, app state, preview cache).
-- [ ] Develop view placeholder.
+- [x] `preview` — `PreviewImage` → `DynamicImage` adapter; on-disk loader for non-RAW formats.
+- [x] Culling TUI (ratatui + ratatui-image, event loop, app state, preview cache, format filter popup).
+- [x] Develop view placeholder.
 - [ ] End-to-end smoke test against a real RAW fixture.
 

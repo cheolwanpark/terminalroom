@@ -8,8 +8,12 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+crossterm.workspace = true
 image.workspace = true
 libraw-rs.workspace = true
+lru.workspace = true
+ratatui.workspace = true
+ratatui-image.workspace = true
 rusqlite.workspace = true
 
 [dev-dependencies]

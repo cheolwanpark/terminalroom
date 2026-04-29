@@ -23,44 +23,42 @@ Linking should prefer the thread-safe LibRaw variant where the platform exposes 
 
 ## ratatui
 
-Use ratatui as the immediate-mode terminal renderer. Every draw pass should render the full UI from current app state.
+Use ratatui as the immediate-mode terminal renderer. Every draw pass renders the full UI from current app state.
 
-Recommended MVP structure:
+Realized MVP structure (in `tui/`):
 
-- Initialize terminal with ratatui's crossterm-backed helpers or explicit crossterm setup.
-- Keep a single main event loop that alternates input handling and drawing.
-- Split rendering by view: culling view and develop placeholder view.
-- Keep side effects out of rendering functions. DB writes and decode requests should happen in event handling or app update code.
+- Terminal init/teardown via explicit crossterm calls (`enable_raw_mode`, `EnterAlternateScreen`) wrapped in a Drop guard so the terminal is restored even on panic.
+- Single main loop that alternates `event::poll(100ms)` → `app.on_key(...)` and `terminal.draw(...)`.
+- Three view renderers: `culling`, `develop`, `filter`. The filter view is rendered as a `Clear`-backed modal overlay on top of the culling view.
+- Rendering functions are pure: they read from `App` and write to the `Frame`. DB writes and preview decoding happen in the event/loop step (`app.set_state`, `ensure_preview_loaded`), never inside `draw`.
 
-Ratatui does not own input handling. Use crossterm keyboard events for shortcuts.
+Ratatui does not own input handling. Crossterm keyboard events are dispatched per-view (`KeyCode::Char('p')`, etc.).
 
 ## image
 
-Use the `image` crate as the application crate's pixel-data layer. The MVP only needs JPEG decoding (for LibRaw embedded thumbnails) and the `DynamicImage` type that ratatui-image consumes, so build with default features off:
+Use the `image` crate as the application crate's pixel-data layer. The MVP needs JPEG decoding for LibRaw embedded thumbnails and on-disk decoding for non-RAW image files, so build with defaults off and only the formats we ship support for:
 
-- `image = { version = "0.25", default-features = false, features = ["jpeg"] }`
+- `image = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff"] }`
 
-`preview.rs` performs the conversion from `libraw_rs::PreviewImage`:
+`preview.rs` exposes two pieces:
 
-- `PreviewFormat::Jpeg` → `image::load_from_memory_with_format(bytes, ImageFormat::Jpeg)`.
-- `PreviewFormat::Rgb8 { colors: 3, bits_per_channel: 8 }` → `ImageBuffer::<Rgb<u8>, _>::from_raw(...)` wrapped in `DynamicImage::ImageRgb8`.
-- Other RGB layouts (4 channels, 16 bits per channel) currently return an `UnsupportedRgb` error; revisit when a real RAW exposes one.
+- `decode_preview(libraw_rs::PreviewImage)` — pure conversion, no I/O. JPEG bytes go through `image::load_from_memory_with_format`; packed `Rgb8` 3-channel/8-bit becomes `DynamicImage::ImageRgb8`. Other RGB layouts (4 channels, 16 bits per channel) currently return `UnsupportedRgb`.
+- `load_preview(path, ImageKind)` — the high-level loader the TUI calls. Routes `ImageKind::Raw` through `libraw_rs::read_preview` + `decode_preview`; routes `Jpeg`/`Png`/`Tiff` through `image::ImageReader::open(path).with_guessed_format().decode()`.
 
-Keeping JPEG decoding in the application crate preserves the `libraw-rs` boundary: the FFI crate stays free of image-processing dependencies.
+Keeping JPEG decoding in the application crate preserves the `libraw-rs` boundary: the FFI crate stays free of image-processing dependencies, and the `image` crate is the only place that opens non-RAW files.
 
 ## ratatui-image
 
 Use ratatui-image to render preview images in the terminal. It supports multiple terminal graphics protocols and falls back to text-based rendering.
 
-MVP guidance:
+Realized MVP behavior:
 
-- Use `Picker::from_query_stdio()` when possible to detect terminal protocol and font size.
-- Keep `StatefulProtocol` or equivalent ratatui-image render state in app state.
-- Use `StatefulImage` for the main image area because it can adapt to the current render area.
-- Avoid resizing and encoding large images inside every frame. Decode or resize only when the selected image changes or the terminal size changes.
-- Handle encoding errors and show a text placeholder instead of crashing the TUI.
+- `Picker::from_query_stdio()` is called once at TUI startup; if it fails (terminal does not respond to the query), the TUI falls back to `Picker::from_fontsize((1, 2))` and surfaces the warning in the status line. ratatui-image then renders with halfblocks.
+- `StatefulProtocol` instances are stored in an `LruCache<PathBuf, StatefulProtocol>` (capacity 9), owned by `tui::run` and not by `App`. Cache entries are produced by `picker.new_resize_protocol(image)` after `preview::load_preview` succeeds.
+- The main image area uses `StatefulImage::default().resize(Resize::Fit(None))`. The widget handles area-aware resize/encode internally; we don't touch the cache on terminal-resize events.
+- `ensure_preview_loaded` runs once per loop iteration before `draw`. On cache miss it loads synchronously; if loading fails, a text placeholder is shown and the error is captured in `App::status`.
 
-The bottom strip can start as text labels or simple thumbnails. If thumbnails are rendered there, each visible item needs its own image state or a deliberate simplified renderer.
+The right-side filmstrip is text-only with state badges (`✓`/`✗`/`·`) — no per-row image rendering. This keeps the cache small and avoids per-frame encoding for thumbnails. Real mini thumbnails are deferred.
 
 ## SQLite and rusqlite
 

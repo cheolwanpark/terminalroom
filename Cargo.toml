@@ -13,7 +13,11 @@ rust-version = "1.92"
 [workspace.dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
-image = { version = "0.25", default-features = false, features = ["jpeg"] }
+crossterm = "0.28"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff"] }
 libraw-rs = { path = "crates/libraw-rs" }
+lru = "0.12"
+ratatui = "0.29"
+ratatui-image = "4"
 rusqlite = { version = "0.32", features = ["bundled"] }
 tempfile = "3"
