@@ -37,8 +37,14 @@ pub struct RawMetadata {
 pub struct PreviewImage {
     pub width: u32,
     pub height: u32,
-    pub rgba8: Vec<u8>,
+    pub bytes: Vec<u8>,
+    pub format: PreviewFormat,
     pub source: PreviewSource,
+}
+
+pub enum PreviewFormat {
+    Jpeg,
+    Rgb8 { colors: u8, bits_per_channel: u8 },
 }
 
 pub enum PreviewSource {
@@ -50,7 +56,7 @@ pub fn read_metadata(path: &Path) -> Result<RawMetadata>;
 pub fn read_preview(path: &Path) -> Result<PreviewImage>;
 ```
 
-The exact Rust names can change during implementation, but the boundary should stay this simple: the TUI asks for metadata or a preview and receives owned Rust values.
+The exact Rust names can change during implementation, but the boundary should stay this simple: the TUI asks for metadata or a preview and receives owned Rust values. `libraw-rs` returns the preview bytes as LibRaw produced them (JPEG for most embedded thumbnails, packed RGB for processed RAW) plus a `PreviewFormat` tag; JPEG decoding and pixel conversion live in the application crate so the FFI crate stays free of image-processing dependencies.
 
 ## Runtime Flow
 
@@ -86,8 +92,8 @@ Use embedded thumbnails first because culling needs fast visual feedback more th
 
 1. Open the RAW file with a fresh LibRaw handler.
 2. Try `libraw_unpack_thumb`.
-3. Convert `libraw_dcraw_make_mem_thumb` output into RGBA8 if available.
-4. If thumbnail extraction fails or returns an unsupported image type, run a basic processed preview path.
+3. Wrap the `libraw_processed_image_t` returned by `libraw_dcraw_make_mem_thumb` in an owned RAII buffer, copy the bytes out, and tag the format (`Jpeg` for `LIBRAW_IMAGE_JPEG`, `Rgb8` for `LIBRAW_IMAGE_BITMAP`).
+4. If thumbnail extraction fails or returns an unsupported image type, run a basic processed preview path (`libraw_unpack` → `libraw_dcraw_process` → `libraw_dcraw_make_mem_image`).
 5. Always close or recycle the LibRaw handler before returning.
 
 Each LibRaw handler processes one file at a time. Multiple handlers may exist in different threads later, but the first MVP can decode synchronously or through one worker thread if UI blocking becomes visible.
