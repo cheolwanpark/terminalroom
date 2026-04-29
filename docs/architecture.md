@@ -16,11 +16,15 @@ terminalroom/
       Cargo.toml
       src/
         main.rs
+        lib.rs
+        session.rs
+        db.rs
+        preview.rs
 ```
 
 `libraw-rs` is a library crate. It owns LibRaw linking, bindings, unsafe calls, pointer lifetimes, and conversion into safe Rust image data.
 
-`terminalroom` is the application crate. It owns CLI parsing, file discovery, app state, storage, terminal rendering, keyboard input, and view routing.
+`terminalroom` is a library + binary crate. The library half holds the headless modules (`session`, `db`, `preview`) so they can be unit-tested without a TTY. The binary half is the entry point: CLI parsing, terminal rendering, keyboard input, and view routing.
 
 ## Crate Boundary
 
@@ -57,6 +61,16 @@ pub fn read_preview(path: &Path) -> Result<PreviewImage>;
 ```
 
 The exact Rust names can change during implementation, but the boundary should stay this simple: the TUI asks for metadata or a preview and receives owned Rust values. `libraw-rs` returns the preview bytes as LibRaw produced them (JPEG for most embedded thumbnails, packed RGB for processed RAW) plus a `PreviewFormat` tag; JPEG decoding and pixel conversion live in the application crate so the FFI crate stays free of image-processing dependencies.
+
+## Application Modules
+
+The headless half of `terminalroom` is split into three modules under `crates/terminalroom/src/`. Each module owns one responsibility and exposes a small surface that the future TUI consumes.
+
+- `session` — resolves an input path into a `Session { root, files }`. Single file inputs use the parent directory as session root; directory inputs scan immediate children, filter by RAW extension (case-insensitive), and sort by case-insensitive filename. Provides `fingerprint()` (`<size>:<mtime>`) for change detection.
+- `db` — owns the SQLite connection at `<root>/.terminalroom.db`. Handles `PRAGMA user_version` migrations, `sync_files` upsert (creates default `unset` culling rows; never deletes missing files), and `set_state` for culling state changes. `now_unix` is injected so callers control the clock.
+- `preview` — converts `libraw_rs::PreviewImage` into `image::DynamicImage` for the TUI. JPEG bytes go through `image::load_from_memory_with_format`; packed `Rgb8` 3-channel/8-bit becomes `DynamicImage::ImageRgb8`. Other RGB layouts return `PreviewError::UnsupportedRgb` until a real RAW forces support.
+
+Each module has unit tests that run without RAW fixtures: `session` uses `tempfile` directories, `db` uses in-memory and temp-file SQLite, `preview` synthesizes JPEG bytes at test time via the `image` crate's encoder.
 
 ## Runtime Flow
 

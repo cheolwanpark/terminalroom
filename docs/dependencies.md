@@ -34,6 +34,20 @@ Recommended MVP structure:
 
 Ratatui does not own input handling. Use crossterm keyboard events for shortcuts.
 
+## image
+
+Use the `image` crate as the application crate's pixel-data layer. The MVP only needs JPEG decoding (for LibRaw embedded thumbnails) and the `DynamicImage` type that ratatui-image consumes, so build with default features off:
+
+- `image = { version = "0.25", default-features = false, features = ["jpeg"] }`
+
+`preview.rs` performs the conversion from `libraw_rs::PreviewImage`:
+
+- `PreviewFormat::Jpeg` → `image::load_from_memory_with_format(bytes, ImageFormat::Jpeg)`.
+- `PreviewFormat::Rgb8 { colors: 3, bits_per_channel: 8 }` → `ImageBuffer::<Rgb<u8>, _>::from_raw(...)` wrapped in `DynamicImage::ImageRgb8`.
+- Other RGB layouts (4 channels, 16 bits per channel) currently return an `UnsupportedRgb` error; revisit when a real RAW exposes one.
+
+Keeping JPEG decoding in the application crate preserves the `libraw-rs` boundary: the FFI crate stays free of image-processing dependencies.
+
 ## ratatui-image
 
 Use ratatui-image to render preview images in the terminal. It supports multiple terminal graphics protocols and falls back to text-based rendering.

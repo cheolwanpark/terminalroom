@@ -1,7 +1,10 @@
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
 use clap::Parser;
+
+use terminalroom::{db, session};
 
 #[derive(Debug, Parser)]
 #[command(name = "terminalroom")]
@@ -12,15 +15,26 @@ struct Cli {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let path = cli
-        .path
-        .canonicalize()
-        .with_context(|| format!("failed to resolve {}", cli.path.display()))?;
+    let session = session::discover(&cli.path)?;
+    let mut db = db::Db::open(&session.root)?;
+    let now = unix_now();
+    let records = db.sync_files(&session.files, now)?;
 
-    if !path.is_file() && !path.is_dir() {
-        bail!("{} is not a file or directory", path.display());
+    println!("session root: {}", session.root.display());
+    println!("files: {}", records.len());
+    for record in &records {
+        println!(
+            "  {:<7}  {}",
+            record.state.as_str(),
+            record.canonical_path.display()
+        );
     }
-
-    println!("terminalroom scaffold initialized for {}", path.display());
     Ok(())
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
