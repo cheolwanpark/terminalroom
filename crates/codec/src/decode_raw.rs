@@ -45,9 +45,10 @@ pub fn decode_raw(path: &Path) -> Result<Raw, DecodeError> {
 }
 
 /// Demosaic the raw image with `output_color=Raw`, `use_camera_wb=false`, and
-/// return planar f32 camera-linear RGB. The develop pipeline applies WB and
-/// the camera → Rec.2020 matrix downstream (so Temperature/Tint can intercept
-/// before WB).
+/// `no_auto_scale=true`, then return planar f32 camera-linear RGB. LibRaw has
+/// already subtracted the sensor black level before emitting this buffer; the
+/// develop pipeline applies WB and the camera → working matrix downstream (so
+/// Temperature/Tint can intercept before WB).
 ///
 /// `half_size` is the caller's choice — preview wants `true` for ~4× faster
 /// demosaic; export wants `false`.
@@ -68,7 +69,7 @@ pub fn read_camera_linear(
     let mut data = vec![0.0f32; plane * 3];
     let (r, gb) = data.split_at_mut(plane);
     let (g, b) = gb.split_at_mut(plane);
-    let inv = 1.0_f32 / 65535.0;
+    let inv = 1.0_f32 / sensor_white_scale(&raw.sensor_info);
     for (i, px) in demos.pixels.chunks_exact(3).enumerate() {
         r[i] = px[0] as f32 * inv;
         g[i] = px[1] as f32 * inv;
@@ -89,4 +90,15 @@ fn active_dims_after_orientation(sensor: &SensorInfo) -> (u32, u32) {
     } else {
         (w, h)
     }
+}
+
+fn sensor_white_scale(sensor: &SensorInfo) -> f32 {
+    let per_channel = &sensor.white_level.per_channel;
+    let best = [per_channel[0], per_channel[1], per_channel[2]]
+        .into_iter()
+        .filter(|&v| v > 0)
+        .max()
+        .unwrap_or(sensor.white_level.saturation);
+    let global_black = sensor.black_level.global.min(best);
+    best.saturating_sub(global_black).max(1) as f32
 }

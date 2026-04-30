@@ -10,9 +10,10 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// Output color space for `read_demosaiced`. Matches LibRaw's `output_color` codes.
 ///
-/// `Raw` (code 0) skips the camera → output matrix entirely; the buffer is
-/// camera-native demosaiced RGB. The develop pipeline uses it for control over
-/// the cam → working transform (Temperature/Tint operate on this space).
+/// `Raw` (code 0) skips the camera → output matrix entirely. In Terminalroom's
+/// RAW-develop path we also disable LibRaw's `scale_colors()` step, so the
+/// caller receives a black-subtracted, unbalanced demosaiced buffer and owns
+/// white balance plus camera→working conversion end-to-end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputColorSpace {
     Raw,
@@ -114,9 +115,10 @@ pub struct SensorInfo {
     pub camera_wb: [f32; 4],
     /// Daylight white-balance multipliers (libraw `pre_mul[0..4]`).
     pub daylight_wb: [f32; 4],
-    /// Camera native RGB → XYZ matrix (libraw `cam_xyz[0..4][0..3]`). Direction:
-    /// `xyz = cam_to_xyz * camera_rgb`. Row-major; rows correspond to camera
-    /// channels (typically 4 for CMYG sensors, 3 used otherwise).
+    /// LibRaw `cam_xyz[0..4][0..3]`, which maps XYZ → camera space.
+    /// Row-major; rows correspond to camera channels (typically 4 for CMYG
+    /// sensors, 3 used otherwise). Bayer cameras usually expose a 3×3 RGB
+    /// subset with the fourth row unused or zeroed.
     pub cam_to_xyz: [[f32; 3]; 4],
 }
 
@@ -231,6 +233,10 @@ pub fn read_demosaiced(
         ffi::libraw_set_demosaic(handle.as_ptr(), opts.user_qual as c_int);
         ffi::tr_set_half_size(handle.as_ptr(), opts.half_size as c_int);
         ffi::tr_set_use_camera_wb(handle.as_ptr(), opts.use_camera_wb as c_int);
+        ffi::tr_set_no_auto_scale(
+            handle.as_ptr(),
+            matches!(opts.output_color, OutputColorSpace::Raw) as c_int,
+        );
     }
 
     check_cancel(cancel)?;
@@ -572,12 +578,13 @@ mod ffi {
         pub fn libraw_set_demosaic(data: *mut libraw_data_t, value: c_int);
         pub fn libraw_set_output_color(data: *mut libraw_data_t, value: c_int);
         pub fn libraw_set_output_bps(data: *mut libraw_data_t, value: c_int);
-        pub fn libraw_set_gamma(data: *mut libraw_data_t, index: c_int, value: c_double);
+        pub fn libraw_set_gamma(data: *mut libraw_data_t, index: c_int, value: c_float);
         pub fn libraw_set_no_auto_bright(data: *mut libraw_data_t, value: c_int);
 
         // Custom C wrappers (wrapper.c).
         pub fn tr_set_half_size(data: *mut libraw_data_t, value: c_int);
         pub fn tr_set_use_camera_wb(data: *mut libraw_data_t, value: c_int);
+        pub fn tr_set_no_auto_scale(data: *mut libraw_data_t, value: c_int);
 
         pub fn tr_get_make(data: *mut libraw_data_t) -> *const c_char;
         pub fn tr_get_model(data: *mut libraw_data_t) -> *const c_char;
@@ -701,6 +708,7 @@ mod tests {
             ffi::libraw_set_demosaic(ptr, 0);
             ffi::tr_set_half_size(ptr, 1);
             ffi::tr_set_use_camera_wb(ptr, 1);
+            ffi::tr_set_no_auto_scale(ptr, 1);
             ffi::libraw_close(ptr);
         }
     }

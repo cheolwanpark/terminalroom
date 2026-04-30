@@ -1,8 +1,10 @@
 //! Camera-linear → working linear Rec.2020.
 //!
 //! Applies (a) per-channel white-balance multipliers and (b) the 3×3
-//! camera-RGB → linear-Rec.2020 matrix (composed offline from the libraw
-//! `cam_to_xyz` and the constant XYZ → Rec.2020 matrix at D65).
+//! camera-RGB → linear-Rec.2020 matrix. The matrix follows LibRaw's own
+//! `cam_xyz_coeff()` path: convert `cam_xyz` (`XYZ -> Camera`) into
+//! `rgb_cam` (`Camera -> linear sRGB`) via LibRaw's row normalization and
+//! pseudoinverse, then compose with the linear sRGB → Rec.2020 matrix.
 //!
 //! Both operations are in place on the planar `Buffer<S>`; only the phantom
 //! type changes from `CameraLinear` to `LinearRec2020`.
@@ -13,6 +15,7 @@ use wide::f32x8;
 use crate::simd::apply_3x3_planar;
 use crate::space::{Buffer, CameraLinear, LinearRec2020};
 use crate::transform::InPlaceTransform;
+use crate::transform::matrix::{REC2020_TO_SRGB, SRGB_TO_REC2020};
 
 /// XYZ → linear Rec.2020 (BT.2020 primaries) at D65.
 pub(crate) const XYZ_TO_REC2020_D65: [[f32; 3]; 3] = [
@@ -21,15 +24,23 @@ pub(crate) const XYZ_TO_REC2020_D65: [[f32; 3]; 3] = [
     [0.01764, -0.04277, 0.94210],
 ];
 
-/// Composes `xyz_to_rec2020 * cam_to_xyz_3x3` and returns a 3×3 matrix taking
-/// camera RGB directly to linear Rec.2020.
+/// Equivalent to LibRaw's `cam_xyz_coeff()` + `convert_to_rgb()` path for a
+/// Rec.2020 output space: `cam_xyz` -> `rgb_cam` -> `sRGB -> Rec.2020`.
 pub fn cam_to_rec2020_from_sensor(sensor: &SensorInfo) -> [[f32; 3]; 3] {
-    let cam_to_xyz_3x3: [[f32; 3]; 3] = [
+    let xyz_to_cam_3x3: [[f32; 3]; 3] = [
         sensor.cam_to_xyz[0],
         sensor.cam_to_xyz[1],
         sensor.cam_to_xyz[2],
     ];
-    matmul3x3(XYZ_TO_REC2020_D65, cam_to_xyz_3x3)
+    let xyz_to_srgb = matmul3x3(REC2020_TO_SRGB, XYZ_TO_REC2020_D65);
+    let mut cam_rgb = matmul3x3(xyz_to_cam_3x3, xyz_to_srgb);
+    normalize_cam_rgb_rows(&mut cam_rgb);
+    let rgb_cam = rgb_cam_from_cam_rgb(cam_rgb).unwrap_or([
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+    ]);
+    matmul3x3(SRGB_TO_REC2020, rgb_cam)
 }
 
 fn matmul3x3(a: [[f32; 3]; 3], b: [[f32; 3]; 3]) -> [[f32; 3]; 3] {
@@ -46,6 +57,71 @@ fn matmul3x3(a: [[f32; 3]; 3], b: [[f32; 3]; 3]) -> [[f32; 3]; 3] {
     out
 }
 
+fn normalize_cam_rgb_rows(cam_rgb: &mut [[f32; 3]; 3]) {
+    for row in cam_rgb.iter_mut() {
+        let sum: f32 = row.iter().sum();
+        if sum.abs() > 1.0e-8 {
+            for v in row.iter_mut() {
+                *v /= sum;
+            }
+        } else {
+            *row = [0.0, 0.0, 0.0];
+        }
+    }
+}
+
+fn rgb_cam_from_cam_rgb(cam_rgb: [[f32; 3]; 3]) -> Option<[[f32; 3]; 3]> {
+    let pseudo = pseudoinverse3x3(cam_rgb)?;
+    let mut out = [[0.0; 3]; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            out[i][j] = pseudo[j][i];
+        }
+    }
+    Some(out)
+}
+
+fn pseudoinverse3x3(input: [[f32; 3]; 3]) -> Option<[[f32; 3]; 3]> {
+    let mut work = [[0.0_f32; 6]; 3];
+    for i in 0..3 {
+        for j in 0..6 {
+            work[i][j] = if j == i + 3 { 1.0 } else { 0.0 };
+        }
+        for j in 0..3 {
+            for row in &input {
+                work[i][j] += row[i] * row[j];
+            }
+        }
+    }
+    for i in 0..3 {
+        let num = work[i][i];
+        if !num.is_finite() || num.abs() <= 1.0e-8 {
+            return None;
+        }
+        for j in 0..6 {
+            work[i][j] /= num;
+        }
+        for k in 0..3 {
+            if k == i {
+                continue;
+            }
+            let factor = work[k][i];
+            for j in 0..6 {
+                work[k][j] -= work[i][j] * factor;
+            }
+        }
+    }
+    let mut out = [[0.0_f32; 3]; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            for k in 0..3 {
+                out[i][j] += work[j][k + 3] * input[i][k];
+            }
+        }
+    }
+    Some(out)
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct CameraToWorking {
     /// White balance multipliers: R, G, B (G2 not used for 3-channel demosaic
@@ -56,8 +132,8 @@ pub struct CameraToWorking {
 }
 
 impl CameraToWorking {
-    /// Build from a `SensorInfo` using the camera's as-shot WB and the libraw
-    /// `cam_to_xyz` matrix composed with the D65 XYZ → Rec.2020 matrix.
+    /// Build from a `SensorInfo` using the camera's as-shot WB and LibRaw's
+    /// `cam_xyz_coeff()`-equivalent camera → Rec.2020 matrix.
     pub fn from_sensor(sensor: &SensorInfo) -> Self {
         // Normalize WB so the green channel is 1.0. Cameras report cam_mul as
         // raw-domain multipliers; without normalization the entire image
@@ -153,5 +229,30 @@ mod tests {
         let m = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]];
         assert_eq!(matmul3x3(id, m), m);
         assert_eq!(matmul3x3(m, id), m);
+    }
+
+    #[test]
+    fn pseudoinverse_round_trips_square_input() {
+        let cam_rgb = [[0.68, 0.21, 0.11], [0.12, 0.77, 0.11], [0.03, 0.19, 0.78]];
+        let rgb_cam = rgb_cam_from_cam_rgb(cam_rgb).expect("invertible");
+        let prod = matmul3x3(rgb_cam, cam_rgb);
+        for (row, expected_row) in
+            prod.iter()
+                .zip([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+        {
+            for (&got, expected) in row.iter().zip(expected_row) {
+                assert!((got - expected).abs() < 1e-4, "{got} != {expected}");
+            }
+        }
+    }
+
+    #[test]
+    fn normalized_rows_preserve_neutral() {
+        let mut cam_rgb = [[2.0, 1.0, 1.0], [1.0, 3.0, 2.0], [0.5, 0.5, 1.0]];
+        normalize_cam_rgb_rows(&mut cam_rgb);
+        for row in cam_rgb {
+            let sum: f32 = row.iter().sum();
+            assert!((sum - 1.0).abs() < 1e-6);
+        }
     }
 }

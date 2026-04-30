@@ -184,7 +184,7 @@ When the selected file changes, the terminal resize moves the preview target ≥
 1. Show whatever the cache already holds for the new file *if* its `params_fingerprint` matches the current one.
 2. Bump a per-selection generation and flip the prior selection's cancel flag, then enqueue one job for the new selection at the new target size and current params. Each job carries an `Arc<AtomicBool>` cancel flag, a clone of the `DevelopParams`, and the file's `size_bytes`.
 3. The worker calls `darkroom::decode` (cheap header read), builds a `FileMeta` from the result, and runs `pipeline::develop_preview`:
-   - `Raw` → `codec::read_camera_linear` (libraw `output_color=Raw`, `use_camera_wb=false`, `half_size=true` for preview) → planar f32 buffer → resize to target → `CameraToWorking` (WB + cam→Rec.2020) → 12-knob chain → `Rec2020ToSrgb` → `SrgbEncode`.
+   - `Raw` → `codec::read_camera_linear` (libraw `output_color=Raw`, `use_camera_wb=false`, Raw-mode `no_auto_scale=true`, `half_size=true` for preview) → planar f32 buffer normalized against sensor white after black subtraction → resize to target → `CameraToWorking` (WB + LibRaw-aligned cam→Rec.2020) → 12-knob chain → `Rec2020ToSrgb` → `SrgbEncode`.
    - `Jpeg` → `read_image_pixels` via `jpeg-decoder` with IDCT `.scale()` to the target size.
    - `Png` / `Tiff` → `read_image_pixels` via `image::ImageReader::open` at native resolution, then resize.
    EXIF orientation is read at decode time and applied so portraits render upright. For RAW the libraw `flip` code drives auto-rotate inside `read_demosaiced` (`params.user_flip = -1`).

@@ -73,7 +73,7 @@ terminalroom/
 
 Dependency direction is strictly linear: `libraw-rs` → `codec` → `darkroom` → `terminalroom`. Each crate has a single responsibility; nothing reaches across stages.
 
-`libraw-rs` is a library crate. It owns LibRaw linking, bindings, unsafe calls, pointer lifetimes, and conversion into safe owned Rust buffers. `wrapper.c` (compiled via the `cc` build-dep) exposes per-field accessors over `libraw_data_t.{idata, sizes, color, other}` that the C API doesn't surface as getters, plus `tr_set_half_size` / `tr_set_use_camera_wb` for the two `imgdata.params` fields lacking public C setters.
+`libraw-rs` is a library crate. It owns LibRaw linking, bindings, unsafe calls, pointer lifetimes, and conversion into safe owned Rust buffers. `wrapper.c` (compiled via the `cc` build-dep) exposes per-field accessors over `libraw_data_t.{idata, sizes, color, other}` that the C API doesn't surface as getters, plus `tr_set_half_size` / `tr_set_use_camera_wb` / `tr_set_no_auto_scale` for the `imgdata.params` fields the develop path needs to override.
 
 `codec` is a library crate. It owns the file ↔ memory-struct conversion and exposes two structs — `Image` (sRGB image-format files: JPEG/PNG/TIFF) and `Raw` (RAW files, header-only). Both carry shot-info; `Raw` additionally carries sensor-info. Pixel buffers are loaded lazily via `read_image_pixels` (sRGB) and `read_camera_linear` (planar f32 camera-linear). EXIF parsing for image-format files goes through `kamadak-exif`; for RAW it goes through libraw's `imgother`.
 
@@ -107,7 +107,7 @@ pub struct SensorInfo {
     pub white_level: WhiteLevel,     // saturation + per-channel
     pub camera_wb: [f32; 4],         // cam_mul (as-shot)
     pub daylight_wb: [f32; 4],       // pre_mul
-    pub cam_to_xyz: [[f32; 3]; 4],   // camera RGB → XYZ (D50 by libraw convention)
+    pub cam_to_xyz: [[f32; 3]; 4],   // libraw cam_xyz: XYZ → camera space
 }
 
 pub struct DemosaicOptions {
@@ -127,7 +127,7 @@ pub fn read_header(path: &Path) -> Result<(ShotInfo, SensorInfo)>;
 pub fn read_demosaiced(path: &Path, opts: &DemosaicOptions, cancel: Option<&AtomicBool>) -> Result<DemosaicedRaw>;
 ```
 
-`libraw-rs` exposes *capabilities*, not policy: callers pick which to use. `read_demosaiced` configures the output for true linear (`output_bps=16`, `gamm[0]=gamm[1]=1.0`, `no_auto_bright=1`) and applies camera WB only when requested. The develop pipeline drives `output_color = Raw` (libraw code 0) with `use_camera_wb = false` so darkroom owns the WB and camera→working transform end-to-end. Cancel is checked between FFI stages.
+`libraw-rs` exposes *capabilities*, not policy: callers pick which to use. `read_demosaiced` configures the output for true linear (`output_bps=16`, `gamm[0]=gamm[1]=1.0`, `no_auto_bright=1`) and applies camera WB only when requested. The develop pipeline drives `output_color = Raw` (libraw code 0) with `use_camera_wb = false` and Raw-mode `no_auto_scale = true` so darkroom owns the WB and camera→working transform end-to-end from a black-subtracted, unbalanced buffer. Cancel is checked between FFI stages.
 
 ## Application Modules
 
@@ -135,7 +135,7 @@ pub fn read_demosaiced(path: &Path, opts: &DemosaicOptions, cancel: Option<&Atom
 
 - `format` — the `ImageKind` enum (`Raw`, `Jpeg`, `Png`, `Tiff`), per-format extension lists, and `classify(extension) -> Option<ImageKind>`. Owned here because dispatch routes by `ImageKind`.
 - `decode_image` — `Image { source, kind, width, height, orientation, shot_info }`, `decode_image(path)`, `read_image_pixels(img, target, cancel) -> Srgb8Pixels`.
-- `decode_raw` — `Raw { source, width, height, shot_info, sensor_info }`, `decode_raw(path)`, `read_camera_linear(raw, half_size, cancel) -> CameraLinearPixels`. `read_camera_linear` drives libraw with `output_color=Raw` and `use_camera_wb=false`; the result is planar f32 (`R..R G..G B..B`) so it drops directly into the develop pipeline's planar SIMD kernels.
+- `decode_raw` — `Raw { source, width, height, shot_info, sensor_info }`, `decode_raw(path)`, `read_camera_linear(raw, half_size, cancel) -> CameraLinearPixels`. `read_camera_linear` drives libraw with `output_color=Raw`, `use_camera_wb=false`, and Raw-mode `no_auto_scale=true`; the result is planar f32 (`R..R G..G B..B`) normalized against sensor white after black subtraction, so it drops directly into the develop pipeline's planar SIMD kernels.
 - `jpeg` — shared JPEG decoder helpers (`decode_jpeg_to_srgb8`, orientation utilities) for the image-format input pipeline.
 - `metadata` — kamadak-exif wrapper that turns a TIFF/JPEG/PNG/HEIF container's EXIF segment into `ShotInfo` + orientation.
 
@@ -144,7 +144,7 @@ pub fn read_demosaiced(path: &Path, opts: &DemosaicOptions, cancel: Option<&Atom
 `darkroom` exposes seven top-level modules under `crates/darkroom/src/`:
 
 - `space` — `ColorSpace` marker trait + unit-struct tags (`CameraLinear`, `LinearRec2020`, `LinearSrgb`, `Oklab`, `Oklch`); the planar f32 `Buffer<S>` type with a single `Vec<f32>` laid out `R..R G..G B..B`; the `Srgb8` output struct.
-- `transform` — `Transform` (general A→B) and `InPlaceTransform` (same-layout reinterpretation) traits, plus impls: `transform::matrix::{Rec2020ToSrgb, SrgbToRec2020}`, `transform::oklab::{LinearToOklab, OklabToLinear, OklabToOklch, OklchToOklab}`, `transform::camera::CameraToWorking` (per-channel WB followed by the offline-composed cam→Rec.2020 matrix), `transform::encode::{SrgbEncode, SrgbDecode}` (linear↔8-bit sRGB via a precomputed 16-bit→8-bit LUT private to the module).
+- `transform` — `Transform` (general A→B) and `InPlaceTransform` (same-layout reinterpretation) traits, plus impls: `transform::matrix::{Rec2020ToSrgb, SrgbToRec2020}`, `transform::oklab::{LinearToOklab, OklabToLinear, OklabToOklch, OklchToOklab}`, `transform::camera::CameraToWorking` (per-channel WB followed by a LibRaw-aligned camera→Rec.2020 matrix built from `cam_xyz` via row normalization, pseudoinverse, and sRGB→Rec.2020 composition), `transform::encode::{SrgbEncode, SrgbDecode}` (linear↔8-bit sRGB via a precomputed 16-bit→8-bit LUT private to the module).
 - `control` — `Control` and `Blend` traits + closed `Op` enum + 12 controls grouped by stage: `input` (Exposure, Temperature, Tint), `tone` (Contrast, Shadows, Blacks, SoftHighlights{Tone,Chroma} — hue-preserving via Y-extract + tone curve + Y'/Y rescale), `color` (Warmth, Color), `detail` (Clarity, Grain), `look` (`Look` trait + `Identity`/`WarmMutedSoft` presets + `LookStrength` blend).
 - `primitive` — shared building blocks: `luminance` (Rec.2020 / Rec.709 weights + the Y'/Y rescale), `curve::ToneCurve` (parametric S-curve over log-luminance), `mask` (smoothstep highlight/shadow/midtone/near-black masks), `protect` (skin/specular guards), `blur` (separable Gaussian for Clarity), `noise` (deterministic SplitMix-flavored hash for Grain).
 - `simd` — `wide::f32x8` helpers tied to the planar layout: `map_f32x8` (one-channel in-place map), `map_pixel_f32x8` (three-channel per-pixel map), `apply_3x3_planar` (matrix multiply via splat + multiply). Tail handling pads to 8 lanes and writes back the prefix.
@@ -220,7 +220,7 @@ There is one preview path; the only differences are libraw's `half_size` flag an
 - **Develop focus**: same call site, but the user has been adjusting `app.develop_params`; the cache invalidates on params fingerprint change so each knob press triggers a re-render.
 - **Export** (post-MVP): `pipeline::develop_full(loaded, &params, target, cancel)` — libraw `half_size=false`, full or user-supplied target.
 
-For RAW: `codec::read_camera_linear` calls libraw with `output_color=Raw`, `use_camera_wb=false`, `output_bps=16`, `gamma=1.0`, `no_auto_bright=1`. The result is interleaved u16 from libraw, deinterleaved into a planar f32 `Vec<f32>` (length `3 * w * h`) at the codec boundary. From there the develop pipeline owns the buffer.
+For RAW: `codec::read_camera_linear` calls libraw with `output_color=Raw`, `use_camera_wb=false`, Raw-mode `no_auto_scale=true`, `output_bps=16`, `gamma=1.0`, `no_auto_bright=1`. The result is interleaved u16 from libraw, deinterleaved into a planar f32 `Vec<f32>` (length `3 * w * h`) at the codec boundary and normalized against sensor white after black subtraction. From there the develop pipeline owns the buffer.
 
 For image-format files (JPEG/PNG/TIFF) the worker calls `read_image_pixels` on every (re-)render, scaled to the preview target: JPEG goes through `jpeg-decoder`'s `.scale()` IDCT factor (1/2/4/8); PNG/TIFF go through `image::ImageReader` at native resolution. EXIF orientation is applied at decode time via `kamadak-exif`. The MVP image-format path applies no knobs — it's identity color-wise.
 
@@ -236,7 +236,7 @@ The two paths handle color very differently:
 - **RAW** (`pipeline::develop_raw_full`): the source is camera-native linear (libraw `output_color=Raw`, no WB, no matrix). The pipeline:
   1. Wraps the planar f32 in `Buffer<CameraLinear>` and resizes to target.
   2. Applies Temperature/Tint as per-channel gain on camera-linear (before WB, so the user is adjusting illuminant rather than fighting it).
-  3. `CameraToWorking` applies the WB multipliers (G-normalized) and the camera→Rec.2020 matrix (composed offline as `xyz_to_rec2020(D65) · cam_to_xyz`), producing `Buffer<LinearRec2020>`.
+  3. `CameraToWorking` applies the WB multipliers (G-normalized) and a LibRaw-aligned camera→Rec.2020 matrix derived from `cam_xyz_coeff()` semantics (`cam_xyz` row normalization + pseudoinverse + sRGB→Rec.2020), producing `Buffer<LinearRec2020>`.
   4. Exposure is a uniform gain in working linear.
   5. Look (currently `Identity` or `WarmMutedSoft`) applies in linear Rec.2020, with `LookStrength` blending in linear toward neutral.
   6. Tone fine-tune (Contrast, Soft-Highlights tone, Shadows, Blacks) operates in linear Rec.2020 by extracting Y (Rec.2020 weights), evaluating a curve in log2-EV space, and scaling RGB by Y'/Y. This preserves hue without a separate log-luma buffer state.
