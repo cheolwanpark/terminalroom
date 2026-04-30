@@ -62,8 +62,12 @@ terminalroom/
         app.rs
         tui/
           mod.rs
-          culling.rs
+          banner.rs
+          preview.rs
           develop.rs
+          info.rs
+          filmstrip.rs
+          status.rs
           filter.rs
 ```
 
@@ -151,16 +155,21 @@ The headless half of `terminalroom` is split into three modules under `crates/te
 
 - `session` — resolves an input path into a `Session { root, files }`. Uses `darkroom::classify` (re-exported from `codec`) to identify supported extensions. Single file inputs use the parent directory as session root; directory inputs scan immediate children, filter by image extension, and sort by case-insensitive filename. Each `DiscoveredFile` carries an `ImageKind` tag so the preview pipeline and filter UI don't have to re-parse extensions. Single-file input rejects unsupported extensions. Provides `fingerprint()` (`<size>:<mtime>`) for change detection.
 - `db` — owns the SQLite connection at `<root>/.terminalroom.db`. Handles `PRAGMA user_version` migrations, `sync_files` upsert (creates default `unset` culling rows; never deletes missing files), and `set_state` for culling state changes. `now_unix` is injected so callers control the clock.
-- `app` — framework-agnostic state and update logic. Owns the `Db`, the `FileEntry` list, the `visible` index list (after filter), the `enabled_formats` set, the `develop_params: DevelopParams`, the `develop_cursor: usize` over the `DEVELOP_KNOBS` table, and the modal `View` (`Culling`/`Develop`/`Filter`). Methods (`next`, `prev`, `set_state`, `toggle_format`, `open_filter`/`close_filter`, `filter_next`/`filter_prev`, `toggle_current_filter`, `develop_next`/`develop_prev`, `develop_adjust`, `develop_reset`) are pure state mutations — no I/O beyond DB writes.
+- `app` — framework-agnostic state and update logic. Owns the `Db`, the `FileEntry` list, the `visible` index list (after filter), the `enabled_formats` set, the `develop_params: DevelopParams`, the `develop_cursor: usize` over the `DEVELOP_KNOBS` table, the `view: View` (`Main`/`Filter`), the `focus: Focus` (`Navigation`/`Develop`), and a `file_meta: HashMap<PathBuf, FileMeta>` cache populated lazily by the preview worker. Methods (`next`, `prev`, `set_state`, `toggle_format`, `open_filter`/`close_filter`, `filter_next`/`filter_prev`, `toggle_current_filter`, `enter_develop`/`exit_develop`, `develop_next`/`develop_prev`, `develop_adjust`, `develop_reset`) are pure state mutations — no I/O beyond DB writes.
 
 The TUI half lives under `crates/terminalroom/src/tui/`:
 
-- `tui::run` — terminal setup with a Drop guard, `Picker::from_query_stdio()` (with halfblocks fallback). Spawns one worker thread that calls `codec::decode` + `pipeline::develop_preview`, plus one event-reader thread that pumps crossterm events through a channel. Main loop runs `crossbeam_channel::select!` over events, completed jobs, and a 100 ms tick. Cache is a single tier `LruCache<PathBuf, PreviewEntry>` where `PreviewEntry` holds `proto: StatefulProtocol`, the rendered source dimensions, the `TargetSize` it was rendered for, and the `params_fingerprint` of the `DevelopParams` that produced it. Selection change, ≥ 25% target change, or knob adjustment (params fingerprint mismatch) re-enqueues a job; stale generations and stale fingerprints are dropped on receive.
-- `tui::culling` — Option B layout: outer vertical split into main area + 1-row status line; inner horizontal split into preview area (left) and filmstrip (right, fixed width). Preview rendering picks the cached `PreviewEntry` (or text placeholder) and computes a centered aspect-fit sub-rect (`aspect_fit_rect`) using `picker.font_size()` so landscape uses full preview width and portrait uses full preview height. Filmstrip is a `List` of text rows with state badges (`✓`/`✗`/`·`).
-- `tui::develop` — knob list rendered as a `List` over `DEVELOP_KNOBS` with the focused row reverse-highlighted, plus a one-line keybind hint. The preview itself is the same cached `PreviewEntry` as the culling view (same worker, same cache; the params change is what triggers re-render).
-- `tui::filter` — modal overlay rendered on top of the culling view: centered `Rect`, `Clear` widget, then a bordered `Block` containing the format list (`[x] JPEG  (12)` rows) and a footer hint.
+- `tui::run` — terminal setup with a Drop guard, `Picker::from_query_stdio()` (with halfblocks fallback). Spawns one worker thread that calls `codec::decode` + `pipeline::develop_preview`, plus one event-reader thread that pumps crossterm events through a channel. Main loop runs `crossbeam_channel::select!` over events, completed jobs, and a 100 ms tick. Cache is a single tier `LruCache<PathBuf, PreviewEntry>` where `PreviewEntry` holds `proto: StatefulProtocol`, the rendered source dimensions, the `TargetSize` it was rendered for, and the `params_fingerprint` of the `DevelopParams` that produced it. Selection change, ≥ 25% target change, or knob adjustment (params fingerprint mismatch) re-enqueues a job; stale generations and stale fingerprints are dropped on receive. Each completed `JobDone` also carries an `Option<FileMeta>` (shot info + dims + size + kind) that `handle_job_done` writes into `app.file_meta` for the Image Info tab.
+- `tui::draw` (in `mod.rs`) — top-level vertical layout: banner / main / status. Inner main is a horizontal split: preview (`Min(20)`) | Develop tab (28 cells) | Image Info tab (28 cells) | Navigation tab / filmstrip (28 cells). Banner height adapts to terminal width via `banner::height_for`. The filter popup is a modal overlay drawn on top when `app.view == View::Filter`. Key dispatch keys on `(view, focus)`: filter view → `handle_filter_key`; main view + Navigation focus → `handle_navigation_key`; main view + Develop focus → `handle_develop_key`. A shared `tab_block(title, focused)` helper produces the focus-aware border (thick yellow when focused, default otherwise).
+- `tui::banner` — multi-line `TERMINALROOM` ASCII figlet (ANSI-Shadow style) with a `height_for(width)` helper and a single-row stylized fallback when the terminal is narrower than the banner.
+- `tui::preview` — preview-area rendering. Owns `aspect_fit_rect(area, src_w, src_h, font_size)` which computes a centered aspect-fit sub-rect using `picker.font_size()` so landscape uses full preview width and portrait uses full preview height. Renders the cached `PreviewEntry` via `StatefulImage` or a text placeholder.
+- `tui::develop` — Develop tab column: knob list rendered as a `List` over `DEVELOP_KNOBS`. Border, label/value styles, and highlight symbol all switch on `app.focus == Focus::Develop` (focused: thick yellow border, bold values, `▶ ` cursor; unfocused: default border, dim values, no cursor symbol).
+- `tui::info` — Image Info tab column. Reads `app.file_meta.get(&path)` for the current selection and renders two sections: `Shoot` (Make / Model / ISO / Shutter / Aperture / Focal — only fields that are `Some`) and `File` (Name / Format / Size / Dims / Orient.). Shows a single dim "loading…" line when meta is not yet cached. Read-only — never gets focus highlight.
+- `tui::filmstrip` — Navigation tab column: filmstrip `List` of text rows with state badges (`✓`/`✗`/`·`) keyed off the cursor. Border switches on `app.focus == Focus::Navigation` like the Develop tab.
+- `tui::status` — bottom 1-row status line. Composes `<filename>  i/N  STATE  [filter:e/t]` and a focus-aware shortcut hint ("j/k navigate · p/x/u cull · f filter · enter develop · q quit" in Navigation focus; "j/k knob · h/l adjust · r reset · esc back · q quit" in Develop focus). Errors in `app.status` replace the shortcut hint until cleared.
+- `tui::filter` — modal overlay rendered on top of the main layout: centered `Rect`, `Clear` widget, then a bordered `Block` containing the format list (`[x] JPEG  (12)` rows) and a footer hint.
 
-Each headless module has unit tests that run without RAW fixtures or a TTY: `session` uses `tempfile` directories, `db` uses in-memory and temp-file SQLite, `decode_image` synthesizes JPEG/PNG/TIFF bytes at test time via the `image` crate's encoder, `darkroom::space`/`simd`/`transform`/`control`/`primitive`/`pipeline` exercise the planar SIMD kernels, OKLab round-trips, BT.2020 → BT.709 white preservation, hue-preserving rescale, knob no-op-at-default, ISO attenuation, deterministic noise, and the JPEG develop path against synthesized buffers; `app` exercises navigation/filter/state logic against in-memory DBs. RAW end-to-end tests are deferred until a fixture is checked in.
+Each headless module has unit tests that run without RAW fixtures or a TTY: `session` uses `tempfile` directories, `db` uses in-memory and temp-file SQLite, `decode_image` synthesizes JPEG/PNG/TIFF bytes at test time via the `image` crate's encoder, `darkroom::space`/`simd`/`transform`/`control`/`primitive`/`pipeline` exercise the planar SIMD kernels, OKLab round-trips, BT.2020 → BT.709 white preservation, hue-preserving rescale, knob no-op-at-default, ISO attenuation, deterministic noise, and the JPEG develop path against synthesized buffers; `app` exercises navigation/filter/state/focus logic against in-memory DBs. The TUI submodules have small isolated tests too — `tui::preview::aspect_fit_rect` (landscape/portrait/non-square cells/zero-dim safety), `tui::banner` (banner row-width invariant + width-fallback), `tui::info` (shutter/byte/truncate formatters). RAW end-to-end tests are deferred until a fixture is checked in.
 
 ## Runtime Flow
 
@@ -170,13 +179,13 @@ Each headless module has unit tests that run without RAW fixtures or a TTY: `ses
 4. If the input is a directory, scan immediate children, filter supported image extensions (RAW + JPEG/PNG/TIFF), sort by filename, and use the directory as the session root.
 5. Open or create `<session-root>/.terminalroom.db`.
 6. Upsert discovered file records.
-7. Build the `App` (zips session files with DB-backed states, computes `available_formats` with per-format counts, seeds `enabled_formats` with all kinds present, initializes `develop_params` to `DevelopParams::default()`).
-8. Start the culling view; spawn the worker thread and the event-reader thread.
-9. On each loop iteration, recompute the target size from the current preview rect (cells × `picker.font_size()`) and the `DevelopParams::fingerprint()`. On selection change — on a target change ≥ 25% in either dim — or on params fingerprint change — bump a `current_generation`, flip the prior selection's `Arc<AtomicBool>` cancel flag, and enqueue a job for the new selection at the new target carrying a clone of `DevelopParams`.
-10. The worker calls `codec::decode(path)` to get a `Loaded`, then `pipeline::develop_preview(&loaded, &params, target, cancel)` to produce an `Srgb8`. For RAW this calls `read_camera_linear` (libraw `half_size=true`, `output_color=Raw`, `use_camera_wb=false`), wraps in `Buffer<CameraLinear>`, resizes to target, applies `CameraToWorking` (WB + cam→Rec.2020 matrix from `SensorInfo`), runs the 12-knob chain, and encodes via `SrgbEncode`. For image files it lazy-decodes via `read_image_pixels` (JPEG IDCT scale; PNG/TIFF full decode) and resizes. Results come back through a channel; stale generations and stale `params_fingerprint` are dropped on receive. On the UI thread the `Srgb8` is wrapped in `DynamicImage::ImageRgb8`, handed to `picker.new_resize_protocol`, and stored in the cache alongside the source dims, the target, and the params fingerprint that produced it.
-11. Persist every culling state change immediately.
-12. Open the filter popup when `f` is pressed; toggling formats rebuilds the visible list, preserving the current selection by canonical path when possible.
-13. Switch to the develop view when `d` is requested; `j/k` move between knobs, `h/l` adjust the focused knob by its step, `r` resets the focused knob to its default, `c` returns to culling. Each knob change updates the `DevelopParams` fingerprint and triggers a re-render of the current selection.
+7. Build the `App` (zips session files with DB-backed states, computes `available_formats` with per-format counts, seeds `enabled_formats` with all kinds present, initializes `develop_params` to `DevelopParams::default()`, sets `view = Main` and `focus = Navigation`, and starts with an empty `file_meta` cache).
+8. Start the TUI; spawn the worker thread and the event-reader thread.
+9. On each loop iteration, recompute the target size from the current preview rect (terminal width minus the three 28-cell side tabs minus 2 preview borders, terminal height minus the banner height minus the status row minus 2 preview borders, multiplied by `picker.font_size()`) and the `DevelopParams::fingerprint()`. On selection change — on a target change ≥ 25% in either dim — or on params fingerprint change — bump a `current_generation`, flip the prior selection's `Arc<AtomicBool>` cancel flag, and enqueue a job for the new selection at the new target carrying a clone of `DevelopParams` and the file's `size_bytes`.
+10. The worker calls `codec::decode(path)` to get a `Loaded`, builds a `FileMeta` from it (shot info, dims, orientation, kind, plus the `size_bytes` from the job), then runs `pipeline::develop_preview(&loaded, &params, target, cancel)` to produce an `Srgb8`. For RAW this calls `read_camera_linear` (libraw `half_size=true`, `output_color=Raw`, `use_camera_wb=false`), wraps in `Buffer<CameraLinear>`, resizes to target, applies `CameraToWorking` (WB + cam→Rec.2020 matrix from `SensorInfo`), runs the 12-knob chain, and encodes via `SrgbEncode`. For image files it lazy-decodes via `read_image_pixels` (JPEG IDCT scale; PNG/TIFF full decode) and resizes. The `Srgb8` and `FileMeta` come back together through a channel; stale generations and stale `params_fingerprint` are dropped on receive. On the UI thread the `Srgb8` is wrapped in `DynamicImage::ImageRgb8`, handed to `picker.new_resize_protocol`, and stored in the cache alongside the source dims, the target, and the params fingerprint that produced it; the `FileMeta` is written into `app.file_meta` so the Image Info tab can render shoot info.
+11. Persist every culling state change immediately (Navigation focus only — `p`/`x`/`u` are inert in Develop focus).
+12. Open the filter popup when `f` is pressed (Navigation focus only); toggling formats rebuilds the visible list, preserving the current selection by canonical path when possible.
+13. Shift focus to the Develop tab when `Enter` is pressed in Navigation focus; `j/k` then move between knobs, `h/l` adjust the focused knob by its step, `r` resets the focused knob to its default, `Esc` returns focus to Navigation. Each knob change updates the `DevelopParams` fingerprint and triggers a re-render of the current selection. Image-navigation keys (`p`/`x`/`u`/`f`) are inert in Develop focus.
 
 For a single-file session, use the file's parent directory as the session root for `.terminalroom.db`.
 
@@ -188,14 +197,16 @@ The actual `App` struct (in `crates/terminalroom/src/app.rs`):
 - `files: Vec<FileEntry>` — every discovered file (1:1 with the scan), each with id, `DiscoveredFile`, and `CullingState`.
 - `visible: Vec<usize>` — indices into `files`, after applying the current format filter.
 - `cursor: usize` — index into `visible`.
-- `view: View` — `Culling`, `Develop`, or `Filter`.
+- `view: View` — `Main` or `Filter` (the filter modal). The Develop column lives inside `Main`.
+- `focus: Focus` — `Navigation` (default) or `Develop`. Selects which key handler runs and which side tab gets the focus border.
 - `enabled_formats: BTreeSet<ImageKind>` — the live filter; mutated by `toggle_format`.
 - `available_formats: Vec<(ImageKind, usize)>` — sorted format list with counts; computed once at init.
 - `filter_cursor: usize` — popup-local row cursor.
 - `status: Option<String>` — transient error/info line for the status bar.
 - `db: Db` — owned SQLite handle for state writes.
 - `develop_params: DevelopParams` — the live knob values; cloned into each preview job. `DevelopParams::default()` is identity (no-op pipeline).
-- `develop_cursor: usize` — index into `DEVELOP_KNOBS` (the static knob table) for the develop view's selection.
+- `develop_cursor: usize` — index into `DEVELOP_KNOBS` (the static knob table) for the Develop tab's selection.
+- `file_meta: HashMap<PathBuf, FileMeta>` — lazy cache of header metadata (shot info + dims + orientation + size + kind) for the Image Info tab. Populated by the preview worker as files are decoded.
 
 The TUI layer (`tui::run`) owns the concurrency-and-rendering state outside `App`: the `Picker`, the `LruCache<PathBuf, PreviewEntry>`, the `crossbeam_channel` senders/receivers, the `current_cancel: Option<Arc<AtomicBool>>`, the per-path `latest_generation: HashMap<PathBuf, u64>`, the `last_params_fp: Option<u64>` for change detection, and the worker/event threads. These are intentionally outside `App` so the headless logic stays free of ratatui and threading types.
 
@@ -203,10 +214,10 @@ Avoid introducing plugin systems, async runtimes, or generalized editing pipelin
 
 ## Preview Loading Strategy
 
-The develop pipeline is the single preview path for both culling and develop view. The only difference is libraw's `half_size` flag and which `DevelopParams` is passed:
+There is one preview path; the only differences are libraw's `half_size` flag and which `DevelopParams` is passed:
 
-- **Culling**: `pipeline::develop_preview(loaded, &app.develop_params, target, cancel)` — libraw `half_size=true` (~4× faster demosaic); develop at TUI target resolution. The default `DevelopParams` is identity, so culling shows the neutral develop unless the user has been editing.
-- **Develop view**: same call site, but the user has been adjusting `app.develop_params`; the cache invalidates on params fingerprint change so each knob press triggers a re-render.
+- **Default render** (Navigation focus): `pipeline::develop_preview(loaded, &app.develop_params, target, cancel)` — libraw `half_size=true` (~4× faster demosaic); develop at TUI target resolution. The default `DevelopParams` is identity, so culling shows the neutral develop unless the user has been editing.
+- **Develop focus**: same call site, but the user has been adjusting `app.develop_params`; the cache invalidates on params fingerprint change so each knob press triggers a re-render.
 - **Export** (post-MVP): `pipeline::develop_full(loaded, &params, target, cancel)` — libraw `half_size=false`, full or user-supplied target.
 
 For RAW: `codec::read_camera_linear` calls libraw with `output_color=Raw`, `use_camera_wb=false`, `output_bps=16`, `gamma=1.0`, `no_auto_bright=1`. The result is interleaved u16 from libraw, deinterleaved into a planar f32 `Vec<f32>` (length `3 * w * h`) at the codec boundary. From there the develop pipeline owns the buffer.

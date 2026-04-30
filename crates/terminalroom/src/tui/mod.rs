@@ -18,27 +18,37 @@ use image::{DynamicImage, ImageBuffer, Rgb};
 use lru::LruCache;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::Size;
+use ratatui::layout::{Constraint, Layout, Size};
+use ratatui::style::{Color, Style};
+use ratatui::widgets::{Block, BorderType, Borders};
 use ratatui_image::Resize;
 use ratatui_image::picker::Picker;
 use ratatui_image::protocol::StatefulProtocol;
 
-use darkroom::{DevelopError, DevelopParams, Srgb8, TargetSize, decode, develop_preview};
+use darkroom::{
+    DevelopError, DevelopParams, ImageKind, Loaded, Srgb8, TargetSize, decode, develop_preview,
+};
 
-use crate::app::{App, View};
+use crate::app::{App, FileMeta, Focus, View};
 use crate::db::CullingState;
 
-mod culling;
+mod banner;
 mod develop;
+mod filmstrip;
 mod filter;
+mod info;
+mod preview;
+mod status;
 
 const TICK: Duration = Duration::from_millis(100);
 const PREVIEW_CACHE_CAP: usize = 9;
-// Filmstrip width + 2-cell preview borders. Mirrors layout in culling.rs.
-const FILMSTRIP_RESERVED_COLS: u16 = 28 + 2;
-// Status row + 2-cell preview borders.
+/// Width of each side tab (Develop, Image Info, Navigation/filmstrip).
+const TAB_WIDTH: u16 = 28;
+/// Total side-tab columns + 2-cell preview borders.
+const SIDE_RESERVED_COLS: u16 = TAB_WIDTH * 3 + 2;
+/// Status row + 2-cell preview borders.
 const STATUS_RESERVED_ROWS: u16 = 1 + 2;
-// Re-enqueue jobs only when target dimensions move at least this fraction.
+/// Re-enqueue jobs only when target dimensions move at least this fraction.
 const TARGET_DEBOUNCE: f64 = 0.25;
 
 pub(crate) struct PreviewEntry {
@@ -56,6 +66,7 @@ struct Job {
     generation: u64,
     params: DevelopParams,
     params_fingerprint: u64,
+    size_bytes: u64,
 }
 
 struct JobDone {
@@ -64,6 +75,7 @@ struct JobDone {
     target: TargetSize,
     params_fingerprint: u64,
     result: std::result::Result<Srgb8, DevelopError>,
+    meta: Option<FileMeta>,
 }
 
 struct TerminalGuard;
@@ -116,9 +128,11 @@ pub fn run(app: &mut App) -> Result<()> {
             width: 80,
             height: 24,
         });
-        let target = preview_target(size, picker.font_size());
+        let banner_h = banner::height_for(size.width);
+        let target = preview_target(size, banner_h, picker.font_size());
 
         let path_now = app.current().map(|e| e.file.canonical_path.clone());
+        let size_now = app.current().map(|e| e.file.size_bytes).unwrap_or(0);
 
         let target_changed = last_target
             .map(|prev| target_changed_meaningfully(prev, target))
@@ -153,6 +167,7 @@ pub fn run(app: &mut App) -> Result<()> {
                         generation: current_generation,
                         params: app.develop_params.clone(),
                         params_fingerprint: params_fp,
+                        size_bytes: size_now,
                     });
                 }
             }
@@ -212,13 +227,18 @@ fn spawn_worker(rx: Receiver<Job>, tx: Sender<JobDone>) {
                 generation,
                 params,
                 params_fingerprint,
+                size_bytes,
             } = job;
-            let result = if cancel.load(Ordering::Relaxed) {
-                Err(DevelopError::Cancelled)
+            let (result, meta) = if cancel.load(Ordering::Relaxed) {
+                (Err(DevelopError::Cancelled), None)
             } else {
                 match decode(&path) {
-                    Ok(loaded) => develop_preview(&loaded, &params, target, Some(&cancel)),
-                    Err(e) => Err(DevelopError::Decode(e)),
+                    Ok(loaded) => {
+                        let meta = file_meta_from(&loaded, size_bytes);
+                        let r = develop_preview(&loaded, &params, target, Some(&cancel));
+                        (r, Some(meta))
+                    }
+                    Err(e) => (Err(DevelopError::Decode(e)), None),
                 }
             };
             if tx
@@ -228,6 +248,7 @@ fn spawn_worker(rx: Receiver<Job>, tx: Sender<JobDone>) {
                     target,
                     params_fingerprint,
                     result,
+                    meta,
                 })
                 .is_err()
             {
@@ -235,6 +256,27 @@ fn spawn_worker(rx: Receiver<Job>, tx: Sender<JobDone>) {
             }
         }
     });
+}
+
+fn file_meta_from(loaded: &Loaded, size_bytes: u64) -> FileMeta {
+    match loaded {
+        Loaded::Image(i) => FileMeta {
+            shot_info: i.shot_info.clone(),
+            width: i.width,
+            height: i.height,
+            orientation: Some(i.orientation),
+            size_bytes,
+            kind: i.kind,
+        },
+        Loaded::Raw(r) => FileMeta {
+            shot_info: r.shot_info.clone(),
+            width: r.width,
+            height: r.height,
+            orientation: None,
+            size_bytes,
+            kind: ImageKind::Raw,
+        },
+    }
 }
 
 fn handle_job_done(
@@ -246,6 +288,10 @@ fn handle_job_done(
 ) {
     if latest_generation.get(&done.path).copied() != Some(done.generation) {
         return;
+    }
+
+    if let Some(meta) = done.meta {
+        app.file_meta.insert(done.path.clone(), meta);
     }
 
     match done.result {
@@ -287,24 +333,45 @@ fn draw(
     cache: &mut LruCache<PathBuf, PreviewEntry>,
     font_size: (u16, u16),
 ) {
-    match app.view {
-        View::Culling => culling::render(frame, app, cache, font_size),
-        View::Develop => develop::render(frame, app),
-        View::Filter => {
-            culling::render(frame, app, cache, font_size);
-            filter::render(frame, app);
-        }
+    let area = frame.area();
+    let banner_h = banner::height_for(area.width);
+    let [banner_area, main_area, status_area] = Layout::vertical([
+        Constraint::Length(banner_h),
+        Constraint::Min(5),
+        Constraint::Length(1),
+    ])
+    .areas(area);
+
+    banner::render(frame, banner_area);
+
+    let [preview_area, develop_area, info_area, filmstrip_area] = Layout::horizontal([
+        Constraint::Min(20),
+        Constraint::Length(TAB_WIDTH),
+        Constraint::Length(TAB_WIDTH),
+        Constraint::Length(TAB_WIDTH),
+    ])
+    .areas(main_area);
+
+    preview::render(frame, app, cache, preview_area, font_size);
+    develop::render(frame, app, develop_area);
+    info::render(frame, app, info_area);
+    filmstrip::render(frame, app, filmstrip_area);
+    status::render(frame, app, status_area);
+
+    if app.view == View::Filter {
+        filter::render(frame, app);
     }
 }
 
-fn preview_target(terminal_size: Size, font_size: (u16, u16)) -> TargetSize {
+fn preview_target(terminal_size: Size, banner_h: u16, font_size: (u16, u16)) -> TargetSize {
     let cols = terminal_size
         .width
-        .saturating_sub(FILMSTRIP_RESERVED_COLS)
+        .saturating_sub(SIDE_RESERVED_COLS)
         .max(1);
     let rows = terminal_size
         .height
         .saturating_sub(STATUS_RESERVED_ROWS)
+        .saturating_sub(banner_h)
         .max(1);
     TargetSize::new(
         cols as u32 * font_size.0 as u32,
@@ -331,22 +398,24 @@ enum Action {
 
 fn handle_key(app: &mut App, key: KeyEvent) -> Action {
     match app.view {
-        View::Culling => handle_culling_key(app, key.code),
-        View::Develop => handle_develop_key(app, key.code),
         View::Filter => handle_filter_key(app, key.code),
+        View::Main => match app.focus {
+            Focus::Navigation => handle_navigation_key(app, key.code),
+            Focus::Develop => handle_develop_key(app, key.code),
+        },
     }
 }
 
-fn handle_culling_key(app: &mut App, code: KeyCode) -> Action {
+fn handle_navigation_key(app: &mut App, code: KeyCode) -> Action {
     match code {
         KeyCode::Char('q') => return Action::Quit,
-        KeyCode::Char('j') | KeyCode::Right => app.next(),
-        KeyCode::Char('k') | KeyCode::Left => app.prev(),
+        KeyCode::Char('j') | KeyCode::Down => app.next(),
+        KeyCode::Char('k') | KeyCode::Up => app.prev(),
         KeyCode::Char('p') => app.set_state(CullingState::Pick, now_unix()),
         KeyCode::Char('x') => app.set_state(CullingState::Reject, now_unix()),
         KeyCode::Char('u') => app.set_state(CullingState::Unset, now_unix()),
-        KeyCode::Char('d') => app.view = View::Develop,
         KeyCode::Char('f') => app.open_filter(),
+        KeyCode::Enter => app.enter_develop(),
         _ => {}
     }
     Action::Continue
@@ -354,33 +423,16 @@ fn handle_culling_key(app: &mut App, code: KeyCode) -> Action {
 
 fn handle_develop_key(app: &mut App, code: KeyCode) -> Action {
     match code {
-        KeyCode::Char('q') => Action::Quit,
-        KeyCode::Char('c') => {
-            app.view = View::Culling;
-            Action::Continue
-        }
-        KeyCode::Char('j') | KeyCode::Down => {
-            app.develop_next();
-            Action::Continue
-        }
-        KeyCode::Char('k') | KeyCode::Up => {
-            app.develop_prev();
-            Action::Continue
-        }
-        KeyCode::Char('h') | KeyCode::Left => {
-            app.develop_adjust(-1.0);
-            Action::Continue
-        }
-        KeyCode::Char('l') | KeyCode::Right => {
-            app.develop_adjust(1.0);
-            Action::Continue
-        }
-        KeyCode::Char('r') => {
-            app.develop_reset();
-            Action::Continue
-        }
-        _ => Action::Continue,
+        KeyCode::Char('q') => return Action::Quit,
+        KeyCode::Esc => app.exit_develop(),
+        KeyCode::Char('j') | KeyCode::Down => app.develop_next(),
+        KeyCode::Char('k') | KeyCode::Up => app.develop_prev(),
+        KeyCode::Char('h') | KeyCode::Left => app.develop_adjust(-1.0),
+        KeyCode::Char('l') | KeyCode::Right => app.develop_adjust(1.0),
+        KeyCode::Char('r') => app.develop_reset(),
+        _ => {}
     }
+    Action::Continue
 }
 
 fn handle_filter_key(app: &mut App, code: KeyCode) -> Action {
@@ -404,4 +456,15 @@ fn now_unix() -> i64 {
 
 pub(crate) fn resize_strategy() -> Resize {
     Resize::Scale(None)
+}
+
+/// Block with the focus-aware border styling shared by the three side tabs.
+pub(crate) fn tab_block(title: &'static str, focused: bool) -> Block<'static> {
+    let mut block = Block::default().borders(Borders::ALL).title(title);
+    if focused {
+        block = block
+            .border_type(BorderType::Thick)
+            .border_style(Style::default().fg(Color::Yellow));
+    }
+    block
 }

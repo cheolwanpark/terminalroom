@@ -4,10 +4,11 @@ Terminalroom is a terminal UI for culling and developing photographs. The first 
 
 - Run `terminalroom <path>`.
 - Load image files (RAW + JPEG/PNG/TIFF) from the target file or directory.
-- Show a culling view with a main preview and a vertical filmstrip on the right.
+- Show a single-screen layout: ASCII banner on top, preview on the left, three side tabs on the right (Develop / Image Info / Navigation), focus-aware status line at the bottom.
+- Cull (`p`/`x`/`u`), navigate (`j`/`k`), and adjust 12 develop knobs from the same screen — `Enter` shifts focus to the Develop tab, `Esc` returns.
 - Filter the visible files by format through a modal popup (key `f`).
 - Persist culling decisions in `<path>/.terminalroom.db`.
-- Provide a develop view with 12 user-facing knobs (Exposure, Temperature, Tint, Look Strength, Warmth, Color, Contrast, Soft Highlights, Shadows, Blacks, Clarity, Grain).
+- Develop knobs: Exposure, Temperature, Tint, Look Strength, Warmth, Color, Contrast, Soft Highlights, Shadows, Blacks, Clarity, Grain.
 
 ## Documents
 
@@ -18,7 +19,7 @@ Terminalroom is a terminal UI for culling and developing photographs. The first 
 
 ## Current Decisions
 
-- Use a Cargo workspace with four crates: `libraw-rs` (FFI), `codec` (file → memory struct with shot/sensor metadata), `darkroom` (develop pipeline), and `terminalroom` (library + binary). The library half of `terminalroom` holds headless modules (`session`, `db`, `app`) so they can be unit-tested without a TTY; `tui/` contains the ratatui rendering, the worker thread, and the event loop.
+- Use a Cargo workspace with four crates: `libraw-rs` (FFI), `codec` (file → memory struct with shot/sensor metadata), `darkroom` (develop pipeline), and `terminalroom` (library + binary). The library half of `terminalroom` holds headless modules (`session`, `db`, `app`) so they can be unit-tested without a TTY; `tui/` contains the ratatui rendering, split per panel (`banner`, `preview`, `develop`, `info`, `filmstrip`, `status`, `filter`), plus the worker thread and the event loop in `tui::mod`.
 - Dependency chain: `libraw-rs` → `codec` → `darkroom` → `terminalroom`. Strict linear pipeline; each crate has a single responsibility.
 - Keep all LibRaw FFI and unsafe code inside `libraw-rs`. The crate exposes capabilities (`read_header`, `read_demosaiced`) plus the metadata types (`ShotInfo`, `SensorInfo`, `OutputColorSpace`, `CfaPattern`, etc.) — orchestration policy lives in `codec`. `OutputColorSpace::Raw` (libraw code 0) is the develop-pipeline workhorse; `Rec2020` and others remain available for callers who want the matrix baked in.
 - Two memory structs in `codec`, one per source kind:
@@ -34,8 +35,11 @@ Terminalroom is a terminal UI for culling and developing photographs. The first 
 - TUI preview rendering uses ratatui-image's `Resize::Scale` and a centered, aspect-fit sub-rect (computed against `picker.font_size()`) so landscape full-fills the width and portrait full-fills the height.
 - Use SQLite through `rusqlite` (bundled feature) for `.terminalroom.db`.
 - Scan only the direct children of a directory for the first MVP. Recursive scanning is deferred.
-- Culling layout: Option B — vertical filmstrip on the right of the main preview (text labels with state badges, no per-row image rendering).
+- Single-screen layout: top ASCII banner (`TERMINALROOM`, ANSI-Shadow), then a horizontal split with the preview on the left and three fixed-width (28-cell) side tabs on the right — `Develop` (12 knobs), `Image Info` (shoot info + file info), `Navigation` (filmstrip with state badges). A 1-row focus-aware status line is at the bottom.
+- Two focus modes inside the main view: `Navigation` (default) handles image nav (`j`/`k`) and culling (`p`/`x`/`u`); `Develop` (entered via `Enter`, exited via `Esc`) handles knob nav (`j`/`k`) and adjustment (`h`/`l`, `r`). Image-nav keys are inert in Develop focus and vice versa — fully modal.
+- The currently focused side tab is drawn with a thick yellow border; the other tabs use the default border. Image Info is read-only and never gets focus.
 - Filter is a session-only modal popup. Toggling rebuilds the visible list without rescanning; selection survives toggles when the current file is still visible.
+- Image Info metadata (shoot info + dimensions) is populated lazily by the preview worker — when a job decodes a file, it includes a `FileMeta` in the result that `tui::mod` writes into `App.file_meta`.
 
 ## Implementation Status
 
@@ -52,8 +56,9 @@ Terminalroom is a terminal UI for culling and developing photographs. The first 
 - [x] `darkroom::common` — `fit_within`, `resize_u8x3`, `resize_f32_planar` (per-plane via `fast_image_resize` `PixelType::F32`).
 - [x] `session` — file scanning (RAW + JPEG/PNG/TIFF), sort, fingerprint.
 - [x] `db` — SQLite v1 schema, migrations, `sync_files`, `set_state`.
-- [x] Culling TUI (ratatui + ratatui-image, single worker + `Srgb8` cache with `params_fingerprint`, format filter popup, aspect-fit centered preview).
-- [x] Develop view (knob list with `j/k/h/l/r/c/q` keybinds, live re-render on knob change).
+- [x] Single-screen TUI (ratatui + ratatui-image, single worker + `Srgb8` cache with `params_fingerprint`, format filter popup, aspect-fit centered preview, ASCII banner with single-row fallback).
+- [x] Develop tab + focus model (`Enter` enters, `Esc` exits; in-focus knob list driven by `j/k/h/l/r`; live re-render on knob change).
+- [x] Image Info tab (shoot info from `ShotInfo` + file info; lazy populated by the worker via `FileMeta`).
 - [ ] End-to-end smoke test against a real RAW fixture.
 - [ ] Sidecar persistence for `DevelopParams` (post-MVP).
 - [ ] Export action (post-MVP, uses `develop_full`).

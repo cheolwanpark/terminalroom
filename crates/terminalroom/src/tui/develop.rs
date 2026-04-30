@@ -1,29 +1,42 @@
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{List, ListItem, ListState};
 
-use crate::app::{App, DEVELOP_KNOBS};
+use super::tab_block;
+use crate::app::{App, DEVELOP_KNOBS, Focus};
 
-pub fn render(frame: &mut Frame, app: &App) {
-    let area = frame.area();
-    let outer = Block::default().borders(Borders::ALL).title("Develop");
-    let inner = outer.inner(area);
-    frame.render_widget(outer, area);
+pub fn render(frame: &mut Frame, app: &App, area: Rect) {
+    let focused = app.focus == Focus::Develop;
+    let block = tab_block("Develop", focused);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
 
-    let layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(2)])
-        .split(inner);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let label_w = label_width(inner.width);
+
+    let value_style = if focused {
+        Style::default().add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().add_modifier(Modifier::DIM)
+    };
+    let label_style = if focused {
+        Style::default()
+    } else {
+        Style::default().add_modifier(Modifier::DIM)
+    };
 
     let items: Vec<ListItem> = DEVELOP_KNOBS
         .iter()
         .map(|(label, knob)| {
             let value = knob.format(&app.develop_params);
             let line = Line::from(vec![
-                Span::raw(format!("{:<18}", label)),
-                Span::styled(value, Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(format!("{:<width$}", label, width = label_w), label_style),
+                Span::styled(value, value_style),
             ]);
             ListItem::new(line)
         })
@@ -35,14 +48,17 @@ pub fn render(frame: &mut Frame, app: &App) {
             .min(DEVELOP_KNOBS.len().saturating_sub(1)),
     ));
 
+    let highlight = Style::default().add_modifier(Modifier::REVERSED);
     let list = List::new(items)
-        .block(Block::default().borders(Borders::NONE))
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-        .highlight_symbol("▶ ");
+        .highlight_style(highlight)
+        .highlight_symbol(if focused { "▶ " } else { "  " });
 
-    frame.render_stateful_widget(list, layout[0], &mut state);
+    frame.render_stateful_widget(list, inner, &mut state);
+}
 
-    let hint = "j/k  navigate    h/l  adjust    r  reset    c  back to culling    q  quit";
-    let hint_p = Paragraph::new(hint);
-    frame.render_widget(hint_p, layout[1]);
+fn label_width(area_width: u16) -> usize {
+    // Tab width is 28 with 2-cell border = 26 inside. Leave room for the
+    // highlight symbol (2) + value (~8). 16 fits "Soft Highlights".
+    let inner = area_width as usize;
+    inner.saturating_sub(10).clamp(8, 18)
 }

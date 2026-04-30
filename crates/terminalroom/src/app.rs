@@ -1,18 +1,23 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 
 use anyhow::{Result, bail};
 
-use darkroom::{DevelopParams, ImageKind};
+use darkroom::{DevelopParams, ImageKind, ShotInfo};
 
 use crate::db::{CullingState, Db, FileRecord};
 use crate::session::{DiscoveredFile, Session};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum View {
-    Culling,
-    Develop,
+    Main,
     Filter,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Focus {
+    Navigation,
+    Develop,
 }
 
 #[derive(Clone, Debug)]
@@ -20,6 +25,20 @@ pub struct FileEntry {
     pub id: i64,
     pub file: DiscoveredFile,
     pub state: CullingState,
+}
+
+/// Cached header metadata for the Image Info tab. Populated lazily by the
+/// preview worker as it decodes each file.
+#[derive(Clone, Debug)]
+pub struct FileMeta {
+    pub shot_info: ShotInfo,
+    pub width: u32,
+    pub height: u32,
+    /// EXIF orientation code (1..=8) for image-format files; `None` for RAW
+    /// (libraw applies orientation internally).
+    pub orientation: Option<u16>,
+    pub size_bytes: u64,
+    pub kind: ImageKind,
 }
 
 /// Knobs presented in the develop view, in display order. Each entry is
@@ -111,6 +130,7 @@ pub struct App {
     pub visible: Vec<usize>,
     pub cursor: usize,
     pub view: View,
+    pub focus: Focus,
     pub enabled_formats: BTreeSet<ImageKind>,
     pub available_formats: Vec<(ImageKind, usize)>,
     pub filter_cursor: usize,
@@ -118,6 +138,7 @@ pub struct App {
     pub db: Db,
     pub develop_params: DevelopParams,
     pub develop_cursor: usize,
+    pub file_meta: HashMap<PathBuf, FileMeta>,
 }
 
 impl App {
@@ -155,7 +176,8 @@ impl App {
             files,
             visible: Vec::new(),
             cursor: 0,
-            view: View::Culling,
+            view: View::Main,
+            focus: Focus::Navigation,
             enabled_formats,
             available_formats,
             filter_cursor: 0,
@@ -163,9 +185,18 @@ impl App {
             db,
             develop_params: DevelopParams::default(),
             develop_cursor: 0,
+            file_meta: HashMap::new(),
         };
         app.rebuild_visible_keep_path(None);
         Ok(app)
+    }
+
+    pub fn enter_develop(&mut self) {
+        self.focus = Focus::Develop;
+    }
+
+    pub fn exit_develop(&mut self) {
+        self.focus = Focus::Navigation;
     }
 
     pub fn develop_next(&mut self) {
@@ -289,7 +320,7 @@ impl App {
     }
 
     pub fn close_filter(&mut self) {
-        self.view = View::Culling;
+        self.view = View::Main;
     }
 
     pub fn filter_next(&mut self) {
@@ -355,6 +386,8 @@ mod tests {
         assert_eq!(app.visible.len(), 3);
         assert_eq!(app.cursor, 0);
         assert_eq!(app.enabled_formats.len(), 3);
+        assert_eq!(app.view, View::Main);
+        assert_eq!(app.focus, Focus::Navigation);
         let labels: Vec<_> = app
             .available_formats
             .iter()
@@ -453,6 +486,18 @@ mod tests {
         assert_eq!(app.visible.len(), 1);
         assert_eq!(app.current().unwrap().file.display_name, "b.jpg");
         app.close_filter();
-        assert_eq!(app.view, View::Culling);
+        assert_eq!(app.view, View::Main);
+    }
+
+    #[test]
+    fn enter_exit_develop_toggles_focus() {
+        let mut app = build_app(vec![file("a.cr3", ImageKind::Raw)]);
+        assert_eq!(app.focus, Focus::Navigation);
+        app.enter_develop();
+        assert_eq!(app.focus, Focus::Develop);
+        // view stays Main while focus shifts.
+        assert_eq!(app.view, View::Main);
+        app.exit_develop();
+        assert_eq!(app.focus, Focus::Navigation);
     }
 }

@@ -60,12 +60,12 @@ Use ratatui as the immediate-mode terminal renderer. Every draw pass renders the
 Realized MVP structure (in `tui/`):
 
 - Terminal init/teardown via explicit crossterm calls (`enable_raw_mode`, `EnterAlternateScreen`) wrapped in a Drop guard so the terminal is restored even on panic.
-- One worker thread runs `codec::decode` + `pipeline::develop_preview` jobs from a `crossbeam_channel`. One event-reader thread feeds crossterm `Event`s into another channel.
+- One worker thread runs `codec::decode` + `pipeline::develop_preview` jobs from a `crossbeam_channel`; each `JobDone` also carries the parsed `FileMeta` (shot info + dims + size + kind) for the Image Info tab. One event-reader thread feeds crossterm `Event`s into another channel.
 - Main loop runs `crossbeam_channel::select!` over events, completed jobs, and a 100 ms tick (used for periodic redraw and to recompute the preview target on terminal resize).
-- Three view renderers: `culling`, `develop`, `filter`. The filter view is rendered as a `Clear`-backed modal overlay on top of the culling view.
-- Rendering functions are pure: they read from `App` and write to the `Frame`. DB writes happen in the event/loop step (`app.set_state`); preview decoding happens off-thread on the worker and lands in the cache via `JobDone` messages.
+- Per-panel renderers: `banner`, `preview`, `develop`, `info`, `filmstrip`, `status`, `filter`. `tui::draw` (in `mod.rs`) lays them out as banner / main / status, where main is preview / Develop tab / Image Info tab / Navigation tab. The filter view is rendered as a `Clear`-backed modal overlay on top of the main layout when `app.view == View::Filter`.
+- Rendering functions are pure: they read from `App` and write to the `Frame`. DB writes happen in the event/loop step (`app.set_state`); preview decoding happens off-thread on the worker and lands in the cache (and `app.file_meta`) via `JobDone` messages.
 
-Ratatui does not own input handling. Crossterm keyboard events are dispatched per-view (`KeyCode::Char('p')`, etc.).
+Ratatui does not own input handling. Crossterm keyboard events are dispatched on `(view, focus)` so the Develop tab is fully modal — image-navigation keys are inert in Develop focus and vice versa.
 
 ## crossbeam-channel
 
@@ -80,9 +80,9 @@ Realized MVP behavior:
 - `Picker::from_query_stdio()` is called once at TUI startup; if it fails (terminal does not respond to the query), the TUI falls back to `Picker::from_fontsize((1, 2))` and surfaces the warning in the status line. ratatui-image then renders with halfblocks.
 - Cache is `LruCache<PathBuf, PreviewEntry>` (capacity 9). Each entry holds a `StatefulProtocol`, the source dims, the `TargetSize` it was rendered for, and the `params_fingerprint` of the `DevelopParams` that produced it. On selection change, significant target change, or knob adjustment (params fingerprint mismatch), the worker re-runs `decode` + `pipeline::develop_preview` and the result replaces the prior entry.
 - The main image area uses `StatefulImage::default().resize(Resize::Scale(None))` — `Scale` (not `Fit`) so the same display rect is filled regardless of source resolution; the terminal-cell size of the preview is computed by `aspect_fit_rect`.
-- A centered, aspect-preserving sub-rect (`aspect_fit_rect` in `tui::culling`) is computed from `(src_w, src_h)` and `picker.font_size()`. Landscape images use full preview width and center vertically; portrait images use full preview height and center horizontally. The sub-rect — not the full preview area — is what gets passed to `StatefulImage`.
+- A centered, aspect-preserving sub-rect (`aspect_fit_rect` in `tui::preview`) is computed from `(src_w, src_h)` and `picker.font_size()`. Landscape images use full preview width and center vertically; portrait images use full preview height and center horizontally. The sub-rect — not the full preview area — is what gets passed to `StatefulImage`.
 
-The right-side filmstrip is text-only with state badges (`✓`/`✗`/`·`) — no per-row image rendering. This keeps the cache small and avoids per-frame encoding for filmstrip rows.
+The right-side Navigation tab is text-only with state badges (`✓`/`✗`/`·`) — no per-row image rendering. This keeps the cache small and avoids per-frame encoding for filmstrip rows.
 
 ## SQLite and rusqlite
 
