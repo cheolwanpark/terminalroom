@@ -187,12 +187,7 @@ impl Db {
         Ok(records)
     }
 
-    pub fn set_state(
-        &mut self,
-        file_id: i64,
-        state: CullingState,
-        now_unix: i64,
-    ) -> Result<()> {
+    pub fn set_state(&mut self, file_id: i64, state: CullingState, now_unix: i64) -> Result<()> {
         let updated = self.conn.execute(
             "UPDATE culling SET state = ?1, updated_unix_seconds = ?2 WHERE file_id = ?3",
             params![state.as_str(), now_unix, file_id],
@@ -327,15 +322,16 @@ mod tests {
             conn.execute_batch("PRAGMA user_version = 99;").unwrap();
         }
         let err = Db::open(tmp.path()).unwrap_err();
-        assert!(
-            err.to_string().contains("99"),
-            "unexpected error: {err}"
-        );
+        assert!(err.to_string().contains("99"), "unexpected error: {err}");
     }
 
     #[test]
     fn culling_state_string_roundtrip() {
-        for s in [CullingState::Unset, CullingState::Pick, CullingState::Reject] {
+        for s in [
+            CullingState::Unset,
+            CullingState::Pick,
+            CullingState::Reject,
+        ] {
             assert_eq!(CullingState::from_db_str(s.as_str()).unwrap(), s);
         }
     }

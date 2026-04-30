@@ -8,6 +8,8 @@ rust-version.workspace = true
 [dependencies]
 codec.workspace = true
 fast_image_resize.workspace = true
+pulp.workspace = true
+wide.workspace = true
 
 [dev-dependencies]
 image.workspace = true

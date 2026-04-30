@@ -9,8 +9,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Output color space for `read_demosaiced`. Matches LibRaw's `output_color` codes.
+///
+/// `Raw` (code 0) skips the camera → output matrix entirely; the buffer is
+/// camera-native demosaiced RGB. The develop pipeline uses it for control over
+/// the cam → working transform (Temperature/Tint operate on this space).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputColorSpace {
+    Raw,
     Srgb,
     AdobeRgb,
     WideGamut,
@@ -24,6 +29,7 @@ pub enum OutputColorSpace {
 impl OutputColorSpace {
     fn as_libraw_code(self) -> c_int {
         match self {
+            OutputColorSpace::Raw => 0,
             OutputColorSpace::Srgb => 1,
             OutputColorSpace::AdobeRgb => 2,
             OutputColorSpace::WideGamut => 3,
@@ -114,18 +120,6 @@ pub struct SensorInfo {
     pub cam_to_xyz: [[f32; 3]; 4],
 }
 
-/// Embedded thumbnail bytes from a RAW container. JPEG-encoded; callers decode
-/// with their own JPEG decoder. Bitmap thumbs are filtered out.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EmbeddedThumb {
-    /// Width as reported by libraw's thumbnail header (may be 0 — decoder will
-    /// re-read from the SOI marker).
-    pub width: u32,
-    pub height: u32,
-    /// JPEG-encoded bytes, exactly as the camera wrote them.
-    pub jpeg_bytes: Vec<u8>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DemosaicOptions {
     pub output_color: OutputColorSpace,
@@ -188,7 +182,10 @@ impl fmt::Display for Error {
                 write!(f, "LibRaw failed to process RAW ({code}): {message}")
             }
             Error::MakeMemImageFailed { code, message } => {
-                write!(f, "LibRaw failed to materialize processed image ({code}): {message}")
+                write!(
+                    f,
+                    "LibRaw failed to materialize processed image ({code}): {message}"
+                )
             }
             Error::UnsupportedOutput {
                 colors,
@@ -213,36 +210,6 @@ impl std::error::Error for Error {}
 pub fn read_header(path: &Path) -> Result<(ShotInfo, SensorInfo)> {
     let handle = RawHandle::open(path)?;
     Ok(unsafe { read_header_from_handle(&handle) })
-}
-
-/// Read the camera's embedded thumbnail. Returns `Ok(None)` when no JPEG thumb
-/// is available (the file may carry a bitmap thumb, or none at all).
-pub fn read_thumbnail(path: &Path) -> Result<Option<EmbeddedThumb>> {
-    let handle = RawHandle::open(path)?;
-
-    let code = unsafe { ffi::libraw_unpack_thumb(handle.as_ptr()) };
-    if code != 0 {
-        return Ok(None);
-    }
-
-    let mut errc: c_int = 0;
-    let raw = unsafe { ffi::libraw_dcraw_make_mem_thumb(handle.as_ptr(), &mut errc) };
-    let img = match NonNull::new(raw) {
-        Some(p) => OwnedProcessedImage { ptr: p },
-        None => return Ok(None),
-    };
-
-    let header = unsafe { img.header() };
-    if header.type_ != ffi::LIBRAW_IMAGE_JPEG {
-        return Ok(None);
-    }
-
-    let bytes = unsafe { img.bytes() }.to_vec();
-    Ok(Some(EmbeddedThumb {
-        width: header.width as u32,
-        height: header.height as u32,
-        jpeg_bytes: bytes,
-    }))
 }
 
 /// Demosaic the raw image to a linear RGB buffer in the chosen output color space.
@@ -575,8 +542,6 @@ mod ffi {
     #[allow(non_camel_case_types)]
     pub enum libraw_data_t {}
 
-    pub const LIBRAW_IMAGE_JPEG: c_int = 1;
-
     #[repr(C)]
     #[allow(non_camel_case_types)]
     pub struct libraw_processed_image_t {
@@ -597,13 +562,8 @@ mod ffi {
         pub fn libraw_version() -> *const c_char;
 
         pub fn libraw_unpack(data: *mut libraw_data_t) -> c_int;
-        pub fn libraw_unpack_thumb(data: *mut libraw_data_t) -> c_int;
         pub fn libraw_dcraw_process(data: *mut libraw_data_t) -> c_int;
         pub fn libraw_dcraw_make_mem_image(
-            data: *mut libraw_data_t,
-            errc: *mut c_int,
-        ) -> *mut libraw_processed_image_t;
-        pub fn libraw_dcraw_make_mem_thumb(
             data: *mut libraw_data_t,
             errc: *mut c_int,
         ) -> *mut libraw_processed_image_t;
@@ -713,23 +673,16 @@ mod tests {
     }
 
     #[test]
-    fn read_thumbnail_on_missing_file_returns_open_error() {
-        let path = missing_path();
-        let err = read_thumbnail(&path).unwrap_err();
-        assert!(matches!(err, Error::OpenFailed { .. }), "got {err:?}");
-    }
-
-    #[test]
     fn read_demosaiced_pre_open_cancel_returns_cancelled() {
         let path = missing_path();
         let flag = AtomicBool::new(true);
-        let err =
-            read_demosaiced(&path, &DemosaicOptions::default(), Some(&flag)).unwrap_err();
+        let err = read_demosaiced(&path, &DemosaicOptions::default(), Some(&flag)).unwrap_err();
         assert!(matches!(err, Error::Cancelled), "got {err:?}");
     }
 
     #[test]
     fn output_color_codes_match_libraw() {
+        assert_eq!(OutputColorSpace::Raw.as_libraw_code(), 0);
         assert_eq!(OutputColorSpace::Srgb.as_libraw_code(), 1);
         assert_eq!(OutputColorSpace::AdobeRgb.as_libraw_code(), 2);
         assert_eq!(OutputColorSpace::Rec2020.as_libraw_code(), 8);

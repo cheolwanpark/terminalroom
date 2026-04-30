@@ -23,7 +23,7 @@ use ratatui_image::Resize;
 use ratatui_image::picker::Picker;
 use ratatui_image::protocol::StatefulProtocol;
 
-use darkroom::{DevelopError, RgbImage, TargetSize, decode, develop_culling};
+use darkroom::{DevelopError, DevelopParams, Srgb8, TargetSize, decode, develop_preview};
 
 use crate::app::{App, View};
 use crate::db::CullingState;
@@ -46,6 +46,7 @@ pub(crate) struct PreviewEntry {
     pub(crate) src_w: u32,
     pub(crate) src_h: u32,
     pub(crate) rendered_target: TargetSize,
+    pub(crate) params_fingerprint: u64,
 }
 
 struct Job {
@@ -53,13 +54,16 @@ struct Job {
     target: TargetSize,
     cancel: Arc<AtomicBool>,
     generation: u64,
+    params: DevelopParams,
+    params_fingerprint: u64,
 }
 
 struct JobDone {
     path: PathBuf,
     generation: u64,
     target: TargetSize,
-    result: std::result::Result<RgbImage, DevelopError>,
+    params_fingerprint: u64,
+    result: std::result::Result<Srgb8, DevelopError>,
 }
 
 struct TerminalGuard;
@@ -74,8 +78,7 @@ impl Drop for TerminalGuard {
 pub fn run(app: &mut App) -> Result<()> {
     enable_raw_mode().context("failed to enable terminal raw mode")?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)
-        .context("failed to enter terminal alternate screen")?;
+    execute!(stdout, EnterAlternateScreen).context("failed to enter terminal alternate screen")?;
     let _guard = TerminalGuard;
 
     let backend = CrosstermBackend::new(io::stdout());
@@ -103,6 +106,7 @@ pub fn run(app: &mut App) -> Result<()> {
         LruCache::new(NonZeroUsize::new(PREVIEW_CACHE_CAP).unwrap());
     let mut last_selection: Option<PathBuf> = None;
     let mut last_target: Option<TargetSize> = None;
+    let mut last_params_fp: Option<u64> = None;
     let mut current_generation: u64 = 0;
     let mut current_cancel: Option<Arc<AtomicBool>> = None;
     let mut latest_generation: HashMap<PathBuf, u64> = HashMap::new();
@@ -120,8 +124,10 @@ pub fn run(app: &mut App) -> Result<()> {
             .map(|prev| target_changed_meaningfully(prev, target))
             .unwrap_or(true);
         let selection_changed = path_now != last_selection;
+        let params_fp = app.develop_params.fingerprint();
+        let params_changed = last_params_fp != Some(params_fp);
 
-        if selection_changed || (path_now.is_some() && target_changed) {
+        if selection_changed || (path_now.is_some() && target_changed) || params_changed {
             // Cancel any in-flight job for the prior generation.
             if let Some(c) = current_cancel.take() {
                 c.store(true, Ordering::Relaxed);
@@ -131,7 +137,10 @@ pub fn run(app: &mut App) -> Result<()> {
             if let Some(path) = path_now.as_ref() {
                 let needs_render = cache
                     .peek(path)
-                    .map(|e| target_changed_meaningfully(e.rendered_target, target))
+                    .map(|e| {
+                        target_changed_meaningfully(e.rendered_target, target)
+                            || e.params_fingerprint != params_fp
+                    })
                     .unwrap_or(true);
                 if needs_render {
                     let cancel = Arc::new(AtomicBool::new(false));
@@ -142,12 +151,15 @@ pub fn run(app: &mut App) -> Result<()> {
                         target,
                         cancel,
                         generation: current_generation,
+                        params: app.develop_params.clone(),
+                        params_fingerprint: params_fp,
                     });
                 }
             }
 
             last_selection = path_now;
             last_target = Some(target);
+            last_params_fp = Some(params_fp);
         }
 
         let font_size = picker.font_size();
@@ -198,12 +210,14 @@ fn spawn_worker(rx: Receiver<Job>, tx: Sender<JobDone>) {
                 target,
                 cancel,
                 generation,
+                params,
+                params_fingerprint,
             } = job;
             let result = if cancel.load(Ordering::Relaxed) {
                 Err(DevelopError::Cancelled)
             } else {
                 match decode(&path) {
-                    Ok(loaded) => develop_culling(&loaded, target, Some(&cancel)),
+                    Ok(loaded) => develop_preview(&loaded, &params, target, Some(&cancel)),
                     Err(e) => Err(DevelopError::Decode(e)),
                 }
             };
@@ -212,6 +226,7 @@ fn spawn_worker(rx: Receiver<Job>, tx: Sender<JobDone>) {
                     path,
                     generation,
                     target,
+                    params_fingerprint,
                     result,
                 })
                 .is_err()
@@ -243,6 +258,7 @@ fn handle_job_done(
                         src_w: w,
                         src_h: h,
                         rendered_target: done.target,
+                        params_fingerprint: done.params_fingerprint,
                     };
                     cache.put(done.path.clone(), entry);
                     if app
@@ -341,6 +357,26 @@ fn handle_develop_key(app: &mut App, code: KeyCode) -> Action {
         KeyCode::Char('q') => Action::Quit,
         KeyCode::Char('c') => {
             app.view = View::Culling;
+            Action::Continue
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            app.develop_next();
+            Action::Continue
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            app.develop_prev();
+            Action::Continue
+        }
+        KeyCode::Char('h') | KeyCode::Left => {
+            app.develop_adjust(-1.0);
+            Action::Continue
+        }
+        KeyCode::Char('l') | KeyCode::Right => {
+            app.develop_adjust(1.0);
+            Action::Continue
+        }
+        KeyCode::Char('r') => {
+            app.develop_reset();
             Action::Continue
         }
         _ => Action::Continue,

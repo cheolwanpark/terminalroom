@@ -30,11 +30,7 @@ pub struct Image {
 /// Open an image file and return its header (dimensions, shot-info, orientation).
 /// Does not decode pixel data.
 pub fn decode_image(path: &Path) -> Result<Image, DecodeError> {
-    let kind = match path
-        .extension()
-        .and_then(|s| s.to_str())
-        .and_then(classify)
-    {
+    let kind = match path.extension().and_then(|s| s.to_str()).and_then(classify) {
         Some(k @ (ImageKind::Jpeg | ImageKind::Png | ImageKind::Tiff)) => k,
         Some(ImageKind::Raw) => return Err(DecodeError::WrongKind { expected: "Image" }),
         None => return Err(DecodeError::UnsupportedExtension),

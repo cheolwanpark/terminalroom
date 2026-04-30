@@ -9,21 +9,11 @@ mod jpeg;
 mod metadata;
 
 pub use decode_image::{Image, decode_image, read_image_pixels};
-pub use decode_raw::{Raw, decode_raw, read_raw_pixels};
+pub use decode_raw::{Raw, decode_raw, read_camera_linear};
 pub use format::{ImageKind, classify};
 pub use libraw_rs::{
     BlackLevel, CfaPattern, OutputColorSpace, Rect, SensorInfo, ShotInfo, WhiteLevel,
 };
-
-/// Eagerly-decoded sRGB 8-bit thumbnail. Source is either an EXIF IFD1
-/// thumbnail (image files) or the camera-embedded JPEG (RAW files).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Thumbnail {
-    pub width: u32,
-    pub height: u32,
-    /// Row-major sRGB 8-bit RGB. `pixels.len() == width * height * 3`.
-    pub pixels: Vec<u8>,
-}
 
 /// Lazily-decoded sRGB 8-bit pixel buffer for an image-format file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,14 +24,18 @@ pub struct Srgb8Pixels {
     pub data: Vec<u8>,
 }
 
-/// Lazily-decoded linear Rec.2020 pixel buffer for a RAW file. Gamma 1.0,
-/// 16 bits per channel, 3 channels, host-endian.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LinearRec2020Pixels {
+/// Lazily-decoded camera-linear pixel buffer. Output of libraw with
+/// `output_color = Raw` and `use_camera_wb = false`: no color matrix applied,
+/// no white balance. Layout is **planar** f32 (`R..R G..G B..B`) so it drops
+/// directly into the develop pipeline's planar SIMD kernels. Values are in
+/// [0, ~1] (libraw's u16 output divided by 65535; per-channel can exceed 1.0
+/// after subsequent gain).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CameraLinearPixels {
     pub width: u32,
     pub height: u32,
-    /// Row-major linear Rec.2020 RGB. `data.len() == width * height * 3`.
-    pub data: Vec<u16>,
+    /// Planar f32 RGB. `data.len() == 3 * width * height`.
+    pub data: Vec<f32>,
 }
 
 /// Target preview size; pixel buffers are decoded at or below this size.
@@ -81,13 +75,6 @@ impl Loaded {
             Self::Raw(r) => (r.width, r.height),
         }
     }
-
-    pub fn preview(&self) -> Option<&Thumbnail> {
-        match self {
-            Self::Image(_) => None,
-            Self::Raw(r) => r.preview.as_ref(),
-        }
-    }
 }
 
 /// Open a file and read its header. Dispatches to [`decode_image`] or
@@ -110,9 +97,7 @@ pub enum DecodeError {
     Raw(libraw_rs::Error),
     UnsupportedJpegPixelFormat(jpeg_decoder::PixelFormat),
     UnsupportedExtension,
-    WrongKind {
-        expected: &'static str,
-    },
+    WrongKind { expected: &'static str },
     Cancelled,
 }
 

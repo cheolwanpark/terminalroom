@@ -21,13 +21,9 @@ pub fn render(
     font_size: (u16, u16),
 ) {
     let area = frame.area();
-    let [main, status] =
-        Layout::vertical([Constraint::Min(5), Constraint::Length(1)]).areas(area);
-    let [preview_area, strip_area] = Layout::horizontal([
-        Constraint::Min(20),
-        Constraint::Length(FILMSTRIP_WIDTH),
-    ])
-    .areas(main);
+    let [main, status] = Layout::vertical([Constraint::Min(5), Constraint::Length(1)]).areas(area);
+    let [preview_area, strip_area] =
+        Layout::horizontal([Constraint::Min(20), Constraint::Length(FILMSTRIP_WIDTH)]).areas(main);
 
     render_preview(frame, app, cache, preview_area, font_size);
     render_filmstrip(frame, app, strip_area);
@@ -46,8 +42,7 @@ fn render_preview(
     frame.render_widget(block, area);
 
     let Some(entry) = app.current() else {
-        let p = Paragraph::new("No images match the current filter.")
-            .wrap(Wrap { trim: true });
+        let p = Paragraph::new("No images match the current filter.").wrap(Wrap { trim: true });
         frame.render_widget(p, inner);
         return;
     };
@@ -141,8 +136,7 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
         };
         let total = app.visible.len();
         let filter_indicator = filter_indicator(app);
-        let shortcuts =
-            "p pick · x reject · u unset · f filter · d develop · q quit";
+        let shortcuts = "p pick · x reject · u unset · f filter · d develop · q quit";
         let prefix = format!(
             "{}   {}/{}   {}{}",
             entry.file.display_name,

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use anyhow::{Result, bail};
 
-use darkroom::ImageKind;
+use darkroom::{DevelopParams, ImageKind};
 
 use crate::db::{CullingState, Db, FileRecord};
 use crate::session::{DiscoveredFile, Session};
@@ -22,6 +22,89 @@ pub struct FileEntry {
     pub state: CullingState,
 }
 
+/// Knobs presented in the develop view, in display order. Each entry is
+/// `(label, kind)`; the cursor indexes into this slice.
+pub const DEVELOP_KNOBS: &[(&str, DevelopKnob)] = &[
+    ("Exposure", DevelopKnob::ExposureEv),
+    ("Temperature", DevelopKnob::TemperatureKelvin),
+    ("Tint", DevelopKnob::Tint),
+    ("Look Strength", DevelopKnob::LookStrength),
+    ("Warmth", DevelopKnob::Warmth),
+    ("Color", DevelopKnob::Color),
+    ("Contrast", DevelopKnob::Contrast),
+    ("Soft Highlights", DevelopKnob::SoftHighlights),
+    ("Shadows", DevelopKnob::Shadows),
+    ("Blacks", DevelopKnob::Blacks),
+    ("Clarity", DevelopKnob::Clarity),
+    ("Grain", DevelopKnob::Grain),
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DevelopKnob {
+    ExposureEv,
+    TemperatureKelvin,
+    Tint,
+    LookStrength,
+    Warmth,
+    Color,
+    Contrast,
+    SoftHighlights,
+    Shadows,
+    Blacks,
+    Clarity,
+    Grain,
+}
+
+impl DevelopKnob {
+    pub fn step(self) -> f32 {
+        match self {
+            Self::ExposureEv => 0.05,
+            Self::TemperatureKelvin => 100.0,
+            _ => 0.05,
+        }
+    }
+    pub fn read(self, p: &DevelopParams) -> f32 {
+        match self {
+            Self::ExposureEv => p.exposure_ev,
+            Self::TemperatureKelvin => p.temperature_kelvin,
+            Self::Tint => p.tint,
+            Self::LookStrength => p.look_strength,
+            Self::Warmth => p.warmth,
+            Self::Color => p.color,
+            Self::Contrast => p.contrast,
+            Self::SoftHighlights => p.soft_highlights,
+            Self::Shadows => p.shadows,
+            Self::Blacks => p.blacks,
+            Self::Clarity => p.clarity,
+            Self::Grain => p.grain,
+        }
+    }
+    pub fn write(self, p: &mut DevelopParams, v: f32) {
+        match self {
+            Self::ExposureEv => p.exposure_ev = v.clamp(-3.0, 3.0),
+            Self::TemperatureKelvin => p.temperature_kelvin = v.clamp(2000.0, 12000.0),
+            Self::Tint => p.tint = v.clamp(-1.0, 1.0),
+            Self::LookStrength => p.look_strength = v.clamp(0.0, 1.0),
+            Self::Warmth => p.warmth = v.clamp(-1.0, 1.0),
+            Self::Color => p.color = v.clamp(-1.0, 1.0),
+            Self::Contrast => p.contrast = v.clamp(-1.0, 1.0),
+            Self::SoftHighlights => p.soft_highlights = v.clamp(0.0, 1.0),
+            Self::Shadows => p.shadows = v.clamp(-1.0, 1.0),
+            Self::Blacks => p.blacks = v.clamp(-1.0, 1.0),
+            Self::Clarity => p.clarity = v.clamp(-1.0, 1.0),
+            Self::Grain => p.grain = v.clamp(0.0, 1.0),
+        }
+    }
+    /// Format the value for display.
+    pub fn format(self, p: &DevelopParams) -> String {
+        match self {
+            Self::ExposureEv => format!("{:+.2} EV", p.exposure_ev),
+            Self::TemperatureKelvin => format!("{:>5.0} K", p.temperature_kelvin),
+            _ => format!("{:+.2}", self.read(p)),
+        }
+    }
+}
+
 pub struct App {
     pub session_root: PathBuf,
     pub files: Vec<FileEntry>,
@@ -33,6 +116,8 @@ pub struct App {
     pub filter_cursor: usize,
     pub status: Option<String>,
     pub db: Db,
+    pub develop_params: DevelopParams,
+    pub develop_cursor: usize,
 }
 
 impl App {
@@ -50,11 +135,7 @@ impl App {
                     f.canonical_path.display()
                 );
             };
-            files.push(FileEntry {
-                id,
-                file: f,
-                state,
-            });
+            files.push(FileEntry { id, file: f, state });
         }
 
         let mut counts: BTreeMap<ImageKind, usize> = BTreeMap::new();
@@ -80,9 +161,42 @@ impl App {
             filter_cursor: 0,
             status: None,
             db,
+            develop_params: DevelopParams::default(),
+            develop_cursor: 0,
         };
         app.rebuild_visible_keep_path(None);
         Ok(app)
+    }
+
+    pub fn develop_next(&mut self) {
+        if self.develop_cursor + 1 < DEVELOP_KNOBS.len() {
+            self.develop_cursor += 1;
+        }
+    }
+
+    pub fn develop_prev(&mut self) {
+        if self.develop_cursor > 0 {
+            self.develop_cursor -= 1;
+        }
+    }
+
+    /// Adjust the focused knob by `direction * step`.
+    pub fn develop_adjust(&mut self, direction: f32) {
+        let Some(&(_, knob)) = DEVELOP_KNOBS.get(self.develop_cursor) else {
+            return;
+        };
+        let current = knob.read(&self.develop_params);
+        let next = current + direction * knob.step();
+        knob.write(&mut self.develop_params, next);
+    }
+
+    /// Reset the focused knob to its default value.
+    pub fn develop_reset(&mut self) {
+        let Some(&(_, knob)) = DEVELOP_KNOBS.get(self.develop_cursor) else {
+            return;
+        };
+        let default = knob.read(&DevelopParams::default());
+        knob.write(&mut self.develop_params, default);
     }
 
     pub fn rebuild_visible(&mut self) {
@@ -247,10 +361,7 @@ mod tests {
             .map(|(k, n)| (k.label(), *n))
             .collect();
         // sorted by label: JPEG, PNG, RAW
-        assert_eq!(
-            labels,
-            vec![("JPEG", 1), ("PNG", 1), ("RAW", 1)]
-        );
+        assert_eq!(labels, vec![("JPEG", 1), ("PNG", 1), ("RAW", 1)]);
     }
 
     #[test]

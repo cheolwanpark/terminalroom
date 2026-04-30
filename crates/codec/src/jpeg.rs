@@ -1,40 +1,13 @@
-//! Shared JPEG decoder helpers used by both `decode_image` (standalone JPEG +
-//! IFD1 thumbnails) and `decode_raw` (camera-embedded thumbnails).
+//! Shared JPEG decoder helpers used by `decode_image` (standalone JPEG and
+//! IFD1 thumbnails for image-format files).
 
-use std::io::{Cursor, Read};
+use std::io::Read;
 use std::sync::atomic::AtomicBool;
 
 use image::metadata::Orientation;
 use image::{DynamicImage, ImageBuffer, Rgb};
 
-use crate::metadata::parse_orientation_from_tiff_chunk;
-use crate::{DecodeError, Srgb8Pixels, TargetSize, Thumbnail, check_cancel};
-
-/// Decode JPEG bytes at native size and apply orientation. The orientation is
-/// read from the JPEG's own EXIF tag if present; otherwise `fallback_orientation`
-/// is used (callers pass the parent file's orientation when the embedded JPEG
-/// carries no EXIF — common for camera RAW thumbnails of older bodies).
-pub(crate) fn decode_jpeg_bytes_to_thumbnail(
-    bytes: &[u8],
-    fallback_orientation: u16,
-) -> Result<Thumbnail, DecodeError> {
-    let mut decoder = jpeg_decoder::Decoder::new(Cursor::new(bytes));
-    decoder.read_info().map_err(DecodeError::Jpeg)?;
-    let pixels = decoder.decode().map_err(DecodeError::Jpeg)?;
-    let info = decoder.info().expect("info available after decode");
-    let (width, height) = (info.width as u32, info.height as u32);
-    let orientation = decoder
-        .exif_data()
-        .and_then(parse_orientation_from_tiff_chunk)
-        .unwrap_or(fallback_orientation);
-    let rgb = pixel_format_to_rgb(info.pixel_format, &pixels)?;
-    let (w, h, data) = apply_orientation_to_rgb8(width, height, rgb, orientation);
-    Ok(Thumbnail {
-        width: w,
-        height: h,
-        pixels: data,
-    })
-}
+use crate::{DecodeError, Srgb8Pixels, TargetSize, check_cancel};
 
 /// Decode a JPEG stream at a target size using IDCT scale factors (1/2/4/8) for
 /// speed, then apply orientation.

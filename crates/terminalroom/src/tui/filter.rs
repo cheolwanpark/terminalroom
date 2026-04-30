@@ -41,8 +41,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         })
         .collect();
 
-    let list = List::new(items)
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     let mut state = ListState::default();
     state.select(Some(app.filter_cursor));
     frame.render_stateful_widget(list, list_area, &mut state);

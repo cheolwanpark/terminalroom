@@ -68,14 +68,6 @@ fn read_orientation(exif: &Exif) -> Option<u16> {
         .map(|v| v as u16)
 }
 
-/// Parse EXIF Orientation directly from a TIFF chunk (the bytes
-/// `jpeg_decoder::Decoder::exif_data()` returns, after the `Exif\0\0` prefix).
-/// Returns `None` when the chunk is unparseable or has no Orientation tag.
-pub(crate) fn parse_orientation_from_tiff_chunk(tiff_bytes: &[u8]) -> Option<u16> {
-    let exif = Reader::new().read_raw(tiff_bytes.to_vec()).ok()?;
-    read_orientation(&exif)
-}
-
 fn string_field(exif: &Exif, tag: Tag) -> Option<String> {
     let field = exif.get_field(tag, In::PRIMARY)?;
     if let Value::Ascii(ref entries) = field.value {

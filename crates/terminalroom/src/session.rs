@@ -28,9 +28,8 @@ pub fn discover(input: &Path) -> Result<Session> {
         .with_context(|| format!("failed to stat {}", canonical.display()))?;
 
     if metadata.is_file() {
-        let kind = path_kind(&canonical).ok_or_else(|| {
-            anyhow!("{} is not a supported image format", canonical.display())
-        })?;
+        let kind = path_kind(&canonical)
+            .ok_or_else(|| anyhow!("{} is not a supported image format", canonical.display()))?;
         let file = describe(&canonical, &metadata, kind)?;
         let root = canonical
             .parent()
@@ -81,11 +80,7 @@ pub fn fingerprint(file: &DiscoveredFile) -> String {
     format!("{}:{}", file.size_bytes, file.modified_unix_seconds)
 }
 
-fn describe(
-    canonical: &Path,
-    metadata: &fs::Metadata,
-    kind: ImageKind,
-) -> Result<DiscoveredFile> {
+fn describe(canonical: &Path, metadata: &fs::Metadata, kind: ImageKind) -> Result<DiscoveredFile> {
     let display_name = canonical
         .file_name()
         .and_then(|n| n.to_str())

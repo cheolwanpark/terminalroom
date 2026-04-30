@@ -79,6 +79,11 @@ q          quit
 Develop view:
 
 ```text
+j / Down   focus next knob
+k / Up     focus previous knob
+h / Left   decrement focused knob by one step
+l / Right  increment focused knob by one step
+r          reset focused knob to default
 c          return to culling view
 q          quit
 ```
@@ -115,38 +120,58 @@ Show the current culling state in the status line:
 
 When the user changes state, persist it immediately to SQLite and update the status line.
 
-## Develop View Placeholder
+## Develop View
 
-The develop view has no editing functionality in the first MVP. It should render:
+The develop view shows the current image with the develop pipeline applied at preview resolution, alongside a list of 12 user-facing knobs grouped by function (Input → Look → Tone → Detail per the design doc). The cursor highlights one knob at a time; `h/l` adjusts that knob by its step, `r` resets it to default, `j/k` move between knobs. The preview re-renders whenever a knob changes (debounced through the same worker thread that handles culling).
 
-```text
-Develop view
-
-Editing controls are not implemented yet.
-
-Press c to return to culling.
-Press q to quit.
-```
-
-Keybindings:
+Layout:
 
 ```text
-c          return to culling view
-q          quit
++----------------------------------+----------------+
+|                                  | Exposure       |
+|                                  |▶ Temperature   |
+|        develop preview           |  Tint          |
+|        (with knobs applied)      |  Look Strength |
+|                                  |  Warmth        |
+|                                  |  …             |
++----------------------------------+----------------+
+| j/k navigate · h/l adjust · r reset · c back · q  |
++---------------------------------------------------+
 ```
+
+Knob set (display order; per-knob ranges live in `app::DevelopKnob`):
+
+```text
+Input          Exposure       (-3..+3 EV, step 0.05)
+               Temperature    (2000..12000 K, step 100)
+               Tint           (-1..+1, step 0.05)
+Look           Look Strength  (0..1, step 0.05)
+Color          Warmth         (-1..+1)
+               Color          (-1..+1)
+Tone           Contrast       (-1..+1)
+               Soft Highlights (0..1)
+               Shadows        (-1..+1)
+               Blacks         (-1..+1)
+Detail         Clarity        (-1..+1)
+               Grain          (0..1)
+```
+
+Defaults are identity (every knob at zero / 5500 K / Look Strength 1.0 with `Identity` look) — pressing `d` from culling shows the same preview, just with the knob list overlaid.
+
+Knob values are session-only in the MVP. Sidecar persistence is post-MVP.
 
 ## Preview Behavior
 
-When the selected file changes (or the terminal resize moves the preview target ≥ 25% in either dim):
+When the selected file changes, the terminal resize moves the preview target ≥ 25% in either dim, or a develop knob is adjusted (the `DevelopParams` fingerprint changes):
 
-1. Show whatever the cache already holds for the new file.
-2. Bump a per-selection generation and flip the prior selection's cancel flag, then enqueue one job for the new selection at the new target size. Each job carries an `Arc<AtomicBool>` cancel flag.
-3. The worker calls `darkroom::decode` (cheap header read) followed by `darkroom::develop_culling`:
-   - `Raw` → resize the eagerly-loaded camera-embedded JPEG thumbnail (fast). If the file has no embedded thumb, fall back to `read_raw_pixels` + the full `raw_develop` pipeline (slow).
+1. Show whatever the cache already holds for the new file *if* its `params_fingerprint` matches the current one.
+2. Bump a per-selection generation and flip the prior selection's cancel flag, then enqueue one job for the new selection at the new target size and current params. Each job carries an `Arc<AtomicBool>` cancel flag and a clone of the `DevelopParams`.
+3. The worker calls `darkroom::decode` (cheap header read) followed by `pipeline::develop_preview`:
+   - `Raw` → `codec::read_camera_linear` (libraw `output_color=Raw`, `use_camera_wb=false`, `half_size=true` for preview) → planar f32 buffer → resize to target → `CameraToWorking` (WB + cam→Rec.2020) → 12-knob chain → `Rec2020ToSrgb` → `SrgbEncode`.
    - `Jpeg` → `read_image_pixels` via `jpeg-decoder` with IDCT `.scale()` to the target size.
    - `Png` / `Tiff` → `read_image_pixels` via `image::ImageReader::open` at native resolution, then resize.
-   EXIF orientation is read at decode time and applied so portraits render upright. RAW thumbnails read orientation from the embedded JPEG's own EXIF when present, with the libraw `flip` code as fallback.
-4. Results land in the LRU preview cache (capacity 9, keyed by canonical path) as `PreviewEntry { proto, src_w, src_h, rendered_target }`. Stale results from prior generations are dropped on receive.
+   EXIF orientation is read at decode time and applied so portraits render upright. For RAW the libraw `flip` code drives auto-rotate inside `read_demosaiced` (`params.user_flip = -1`).
+4. Results land in the LRU preview cache (capacity 9, keyed by canonical path) as `PreviewEntry { proto, src_w, src_h, rendered_target, params_fingerprint }`. Stale results from prior generations are dropped on receive.
 5. The image area renders the cached preview at a centered aspect-fit sub-rect — landscape uses the full preview width centered vertically, portrait uses the full preview height centered horizontally.
 6. If decoding fails, the cache stays empty for that file and a text placeholder is shown with the error surfaced in the status line.
 
@@ -157,6 +182,6 @@ When the selected file changes (or the terminal resize moves the preview target 
 - `p`, `x`, and `u` persist state changes immediately.
 - Restarting the app restores prior culling decisions.
 - `f` opens the format filter popup; toggling a format hides matching files and updates the visible count in the status line.
-- `d` opens the develop placeholder and `c` returns to culling.
+- `d` opens the develop view (12 knobs over the live preview) and `c` returns to culling. `j/k` navigate knobs, `h/l` adjust, `r` resets the focused knob.
 - `q` exits and restores the terminal.
 
