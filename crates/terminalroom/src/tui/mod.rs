@@ -16,9 +16,10 @@ use ratatui_image::Resize;
 use ratatui_image::picker::Picker;
 use ratatui_image::protocol::StatefulProtocol;
 
+use darkroom::preview;
+
 use crate::app::{App, View};
 use crate::db::CullingState;
-use crate::preview;
 
 mod culling;
 mod develop;

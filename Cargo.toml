@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/libraw-rs",
+    "crates/darkroom",
     "crates/terminalroom",
 ]
 resolver = "3"

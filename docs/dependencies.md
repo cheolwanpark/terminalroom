@@ -36,16 +36,16 @@ Ratatui does not own input handling. Crossterm keyboard events are dispatched pe
 
 ## image
 
-Use the `image` crate as the application crate's pixel-data layer. The MVP needs JPEG decoding for LibRaw embedded thumbnails and on-disk decoding for non-RAW image files, so build with defaults off and only the formats we ship support for:
+Use the `image` crate as `darkroom`'s pixel-data layer. The MVP needs JPEG decoding for LibRaw embedded thumbnails and on-disk decoding for non-RAW image files, so build with defaults off and only the formats we ship support for:
 
 - `image = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff"] }`
 
-`preview.rs` exposes two pieces:
+`darkroom::preview` exposes two pieces:
 
 - `decode_preview(libraw_rs::PreviewImage)` — pure conversion, no I/O. JPEG bytes go through `image::load_from_memory_with_format`; packed `Rgb8` 3-channel/8-bit becomes `DynamicImage::ImageRgb8`. Other RGB layouts (4 channels, 16 bits per channel) currently return `UnsupportedRgb`.
 - `load_preview(path, ImageKind)` — the high-level loader the TUI calls. Routes `ImageKind::Raw` through `libraw_rs::read_preview` + `decode_preview`; routes `Jpeg`/`Png`/`Tiff` through `image::ImageReader::open(path).with_guessed_format().decode()`.
 
-Keeping JPEG decoding in the application crate preserves the `libraw-rs` boundary: the FFI crate stays free of image-processing dependencies, and the `image` crate is the only place that opens non-RAW files.
+Keeping JPEG decoding inside `darkroom` preserves the `libraw-rs` boundary (FFI crate stays free of image-processing dependencies) and keeps `terminalroom` free of the `image` dependency — it only sees decoded `DynamicImage` values handed back by `darkroom::preview`.
 
 ## ratatui-image
 
@@ -54,7 +54,7 @@ Use ratatui-image to render preview images in the terminal. It supports multiple
 Realized MVP behavior:
 
 - `Picker::from_query_stdio()` is called once at TUI startup; if it fails (terminal does not respond to the query), the TUI falls back to `Picker::from_fontsize((1, 2))` and surfaces the warning in the status line. ratatui-image then renders with halfblocks.
-- `StatefulProtocol` instances are stored in an `LruCache<PathBuf, StatefulProtocol>` (capacity 9), owned by `tui::run` and not by `App`. Cache entries are produced by `picker.new_resize_protocol(image)` after `preview::load_preview` succeeds.
+- `StatefulProtocol` instances are stored in an `LruCache<PathBuf, StatefulProtocol>` (capacity 9), owned by `tui::run` and not by `App`. Cache entries are produced by `picker.new_resize_protocol(image)` after `darkroom::preview::load_preview` succeeds.
 - The main image area uses `StatefulImage::default().resize(Resize::Fit(None))`. The widget handles area-aware resize/encode internally; we don't touch the cache on terminal-resize events.
 - `ensure_preview_loaded` runs once per loop iteration before `draw`. On cache miss it loads synchronously; if loading fails, a text placeholder is shown and the error is captured in `App::status`.
 

@@ -2,7 +2,7 @@
 
 ## Workspace Shape
 
-The project is a Cargo workspace with two crates:
+The project is a Cargo workspace with three crates:
 
 ```text
 terminalroom/
@@ -12,6 +12,12 @@ terminalroom/
       Cargo.toml
       src/
         lib.rs
+    darkroom/
+      Cargo.toml
+      src/
+        lib.rs
+        format.rs
+        preview.rs
     terminalroom/
       Cargo.toml
       src/
@@ -19,7 +25,6 @@ terminalroom/
         lib.rs
         session.rs
         db.rs
-        preview.rs
         app.rs
         tui/
           mod.rs
@@ -28,13 +33,17 @@ terminalroom/
           filter.rs
 ```
 
+Dependency direction: `libraw-rs` → `darkroom` → `terminalroom`.
+
 `libraw-rs` is a library crate. It owns LibRaw linking, bindings, unsafe calls, pointer lifetimes, and conversion into safe Rust image data.
 
-`terminalroom` is a library + binary crate. The library half holds the headless modules (`session`, `db`, `preview`, `app`) so they can be unit-tested without a TTY; `tui/` is the only module that depends on ratatui/crossterm. The binary half (`main.rs`) is a thin entry point: CLI parsing, then `App::init` and `tui::run`.
+`darkroom` is a library crate. It owns the photo-processing layer: the `ImageKind` taxonomy + extension `classify`, plus the preview decoding pipeline (`decode_preview`, `load_preview`). It depends on `libraw-rs` and the `image` crate. Future develop/edit logic lands here.
+
+`terminalroom` is a library + binary crate. The library half holds the headless modules (`session`, `db`, `app`) so they can be unit-tested without a TTY; `tui/` is the only module that depends on ratatui/crossterm. The binary half (`main.rs`) is a thin entry point: CLI parsing, then `App::init` and `tui::run`.
 
 ## Crate Boundary
 
-The app crate must not depend on LibRaw C symbols directly. Its interaction with RAW files should go through safe `libraw-rs` APIs shaped around the MVP:
+Neither `darkroom` nor `terminalroom` may depend on LibRaw C symbols directly. RAW interaction goes through safe `libraw-rs` APIs (consumed by `darkroom::preview`); `terminalroom` consumes preview results through `darkroom::preview` and never imports `libraw-rs` itself. The `libraw-rs` surface is shaped around the MVP:
 
 ```rust
 pub struct RawMetadata {
@@ -66,15 +75,19 @@ pub fn read_metadata(path: &Path) -> Result<RawMetadata>;
 pub fn read_preview(path: &Path) -> Result<PreviewImage>;
 ```
 
-The exact Rust names can change during implementation, but the boundary should stay this simple: the TUI asks for metadata or a preview and receives owned Rust values. `libraw-rs` returns the preview bytes as LibRaw produced them (JPEG for most embedded thumbnails, packed RGB for processed RAW) plus a `PreviewFormat` tag; JPEG decoding and pixel conversion live in the application crate so the FFI crate stays free of image-processing dependencies.
+The exact Rust names can change during implementation, but the boundary should stay this simple: the TUI asks for metadata or a preview and receives owned Rust values. `libraw-rs` returns the preview bytes as LibRaw produced them (JPEG for most embedded thumbnails, packed RGB for processed RAW) plus a `PreviewFormat` tag; JPEG decoding and pixel conversion live in `darkroom` so the FFI crate stays free of image-processing dependencies.
 
 ## Application Modules
 
-The headless half of `terminalroom` is split into four modules under `crates/terminalroom/src/`. Each module owns one responsibility and exposes a small surface that the TUI consumes.
+`darkroom` exposes two modules under `crates/darkroom/src/`:
 
-- `session` — resolves an input path into a `Session { root, files }`. Single file inputs use the parent directory as session root; directory inputs scan immediate children, filter by image extension (RAW: arw/cr2/cr3/dng/nef/nrw/raf/raw/rw2/orf/pef/srw — plus jpg/jpeg/png/tif/tiff), and sort by case-insensitive filename. Each `DiscoveredFile` carries an `ImageKind` tag (`Raw`, `Jpeg`, `Png`, `Tiff`) so the preview pipeline and filter UI don't have to re-parse extensions. Single-file input rejects unsupported extensions. Provides `fingerprint()` (`<size>:<mtime>`) for change detection.
-- `db` — owns the SQLite connection at `<root>/.terminalroom.db`. Handles `PRAGMA user_version` migrations, `sync_files` upsert (creates default `unset` culling rows; never deletes missing files), and `set_state` for culling state changes. `now_unix` is injected so callers control the clock.
+- `format` — the `ImageKind` enum (`Raw`, `Jpeg`, `Png`, `Tiff`), per-format extension lists (RAW: arw/cr2/cr3/dng/nef/nrw/raf/raw/rw2/orf/pef/srw — plus jpg/jpeg/png/tif/tiff), and `classify(extension) -> Option<ImageKind>`. Owned here because the preview pipeline routes by `ImageKind`.
 - `preview` — converts RAW data and on-disk images into `image::DynamicImage` for the TUI. `decode_preview` consumes `libraw_rs::PreviewImage` (JPEG bytes through `image::load_from_memory_with_format`; packed `Rgb8` 3-channel/8-bit through `ImageBuffer`). `load_preview(path, kind)` is the high-level entry point: it routes RAW through `libraw_rs::read_preview` + `decode_preview`, and JPEG/PNG/TIFF through `image::ImageReader::open`.
+
+The headless half of `terminalroom` is split into three modules under `crates/terminalroom/src/`. Each owns one responsibility and exposes a small surface that the TUI consumes.
+
+- `session` — resolves an input path into a `Session { root, files }`. Uses `darkroom::format::classify` to identify supported extensions. Single file inputs use the parent directory as session root; directory inputs scan immediate children, filter by image extension, and sort by case-insensitive filename. Each `DiscoveredFile` carries an `ImageKind` tag so the preview pipeline and filter UI don't have to re-parse extensions. Single-file input rejects unsupported extensions. Provides `fingerprint()` (`<size>:<mtime>`) for change detection.
+- `db` — owns the SQLite connection at `<root>/.terminalroom.db`. Handles `PRAGMA user_version` migrations, `sync_files` upsert (creates default `unset` culling rows; never deletes missing files), and `set_state` for culling state changes. `now_unix` is injected so callers control the clock.
 - `app` — framework-agnostic state and update logic. Owns the `Db`, the `FileEntry` list, the `visible` index list (after filter), the `enabled_formats` set, and the modal `View` (`Culling`/`Develop`/`Filter`). Methods (`next`, `prev`, `set_state`, `toggle_format`, `open_filter`/`close_filter`, `filter_next`/`filter_prev`, `toggle_current_filter`) are pure state mutations — no I/O beyond DB writes. This makes navigation, filter, and persistence logic unit-testable without touching ratatui.
 
 The TUI half lives under `crates/terminalroom/src/tui/`:
@@ -84,7 +97,7 @@ The TUI half lives under `crates/terminalroom/src/tui/`:
 - `tui::develop` — placeholder paragraph.
 - `tui::filter` — modal overlay rendered on top of the culling view: centered `Rect`, `Clear` widget, then a bordered `Block` containing the format list (`[x] JPEG  (12)` rows) and a footer hint.
 
-Each headless module has unit tests that run without RAW fixtures or a TTY: `session` uses `tempfile` directories, `db` uses in-memory and temp-file SQLite, `preview` synthesizes JPEG bytes at test time via the `image` crate's encoder, and `app` exercises navigation/filter/state logic against in-memory DBs.
+Each headless module has unit tests that run without RAW fixtures or a TTY: `session` uses `tempfile` directories, `db` uses in-memory and temp-file SQLite, `darkroom::preview` synthesizes JPEG bytes at test time via the `image` crate's encoder, and `app` exercises navigation/filter/state logic against in-memory DBs.
 
 ## Runtime Flow
 

@@ -3,8 +3,10 @@ use std::path::PathBuf;
 
 use anyhow::{Result, bail};
 
+use darkroom::format::ImageKind;
+
 use crate::db::{CullingState, Db, FileRecord};
-use crate::session::{DiscoveredFile, ImageKind, Session};
+use crate::session::{DiscoveredFile, Session};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum View {
@@ -206,7 +208,7 @@ impl App {
 mod tests {
     use super::*;
     use crate::db::Db;
-    use crate::session::{DiscoveredFile, ImageKind, Session};
+    use crate::session::{DiscoveredFile, Session};
     use std::path::PathBuf;
 
     fn file(name: &str, kind: ImageKind) -> DiscoveredFile {

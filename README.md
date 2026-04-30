@@ -5,7 +5,8 @@ Terminalroom is a terminal UI for culling and developing photographs. The MVP su
 The Rust workspace:
 
 - `crates/libraw-rs`: safe Rust boundary for LibRaw (RAW metadata + preview extraction).
-- `crates/terminalroom`: library + binary. Headless modules (`session`, `db`, `preview`, `app`) are unit-tested without a TTY; `tui/` contains the ratatui rendering and event loop.
+- `crates/darkroom`: photo-processing layer (format taxonomy + preview decoding pipeline). Depends on `libraw-rs` and the `image` crate.
+- `crates/terminalroom`: library + binary. Headless modules (`session`, `db`, `app`) are unit-tested without a TTY; `tui/` contains the ratatui rendering and event loop. Depends on `darkroom`.
 
 See [`docs/`](docs/README.md) for architecture, dependencies, storage, and UX details.
 

@@ -4,7 +4,7 @@ use std::path::Path;
 use image::{DynamicImage, ImageBuffer, ImageFormat, ImageReader, Rgb};
 use libraw_rs::{PreviewFormat, PreviewImage};
 
-use crate::session::ImageKind;
+use crate::format::ImageKind;
 
 #[derive(Debug)]
 pub enum PreviewError {
