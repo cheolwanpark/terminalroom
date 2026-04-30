@@ -8,7 +8,7 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui_image::StatefulImage;
 
-use super::PreviewSlot;
+use super::PreviewEntry;
 use crate::app::{App, FileEntry};
 use crate::db::CullingState;
 
@@ -17,7 +17,7 @@ const FILMSTRIP_WIDTH: u16 = 28;
 pub fn render(
     frame: &mut Frame,
     app: &App,
-    cache: &mut LruCache<PathBuf, PreviewSlot>,
+    cache: &mut LruCache<PathBuf, PreviewEntry>,
     font_size: (u16, u16),
 ) {
     let area = frame.area();
@@ -37,7 +37,7 @@ pub fn render(
 fn render_preview(
     frame: &mut Frame,
     app: &App,
-    cache: &mut LruCache<PathBuf, PreviewSlot>,
+    cache: &mut LruCache<PathBuf, PreviewEntry>,
     area: Rect,
     font_size: (u16, u16),
 ) {
@@ -52,11 +52,7 @@ fn render_preview(
         return;
     };
 
-    let preview = cache.get_mut(&entry.file.canonical_path).and_then(|slot| {
-        // Disjoint borrows so we can fall back to the fast tier if full isn't ready yet.
-        let (full, fast) = (slot.full.as_mut(), slot.fast.as_mut());
-        full.or(fast)
-    });
+    let preview = cache.get_mut(&entry.file.canonical_path);
 
     if let Some(preview) = preview {
         let centered = aspect_fit_rect(inner, preview.src_w, preview.src_h, font_size);

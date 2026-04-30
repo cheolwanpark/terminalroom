@@ -23,7 +23,7 @@ use ratatui_image::Resize;
 use ratatui_image::picker::Picker;
 use ratatui_image::protocol::StatefulProtocol;
 
-use darkroom::{DevelopError, ImageKind, RgbImage, TargetSize};
+use darkroom::{DevelopError, RgbImage, TargetSize, decode, develop_culling};
 
 use crate::app::{App, View};
 use crate::db::CullingState;
@@ -45,32 +45,20 @@ pub(crate) struct PreviewEntry {
     pub(crate) proto: StatefulProtocol,
     pub(crate) src_w: u32,
     pub(crate) src_h: u32,
-}
-
-pub(crate) struct PreviewSlot {
-    pub(crate) fast: Option<PreviewEntry>,
-    pub(crate) full: Option<PreviewEntry>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Tier {
-    Fast,
-    Full,
+    pub(crate) rendered_target: TargetSize,
 }
 
 struct Job {
     path: PathBuf,
-    kind: ImageKind,
     target: TargetSize,
-    tier: Tier,
     cancel: Arc<AtomicBool>,
     generation: u64,
 }
 
 struct JobDone {
     path: PathBuf,
-    tier: Tier,
     generation: u64,
+    target: TargetSize,
     result: std::result::Result<RgbImage, DevelopError>,
 }
 
@@ -111,7 +99,7 @@ pub fn run(app: &mut App) -> Result<()> {
     spawn_event_thread(event_tx);
     spawn_worker(job_rx, done_tx);
 
-    let mut cache: LruCache<PathBuf, PreviewSlot> =
+    let mut cache: LruCache<PathBuf, PreviewEntry> =
         LruCache::new(NonZeroUsize::new(PREVIEW_CACHE_CAP).unwrap());
     let mut last_selection: Option<PathBuf> = None;
     let mut last_target: Option<TargetSize> = None;
@@ -127,7 +115,6 @@ pub fn run(app: &mut App) -> Result<()> {
         let target = preview_target(size, picker.font_size());
 
         let path_now = app.current().map(|e| e.file.canonical_path.clone());
-        let kind_now = app.current().map(|e| e.file.kind);
 
         let target_changed = last_target
             .map(|prev| target_changed_meaningfully(prev, target))
@@ -135,43 +122,24 @@ pub fn run(app: &mut App) -> Result<()> {
         let selection_changed = path_now != last_selection;
 
         if selection_changed || (path_now.is_some() && target_changed) {
-            // Cancel any previous generation's outstanding work.
+            // Cancel any in-flight job for the prior generation.
             if let Some(c) = current_cancel.take() {
                 c.store(true, Ordering::Relaxed);
             }
             current_generation = current_generation.saturating_add(1);
 
-            if let (Some(path), Some(kind)) = (path_now.as_ref(), kind_now) {
-                let cancel = Arc::new(AtomicBool::new(false));
-                current_cancel = Some(cancel.clone());
-                latest_generation.insert(path.clone(), current_generation);
-
-                let fast_target = TargetSize::new(
-                    (target.max_w / 4).max(1),
-                    (target.max_h / 4).max(1),
-                );
-
-                let (has_fast, has_full) = match cache.peek(path) {
-                    Some(slot) => (slot.fast.is_some(), slot.full.is_some()),
-                    None => (false, false),
-                };
-                // Skip the fast tier when something is already on screen for this file.
-                if !has_fast && !has_full {
+            if let Some(path) = path_now.as_ref() {
+                let needs_render = cache
+                    .peek(path)
+                    .map(|e| target_changed_meaningfully(e.rendered_target, target))
+                    .unwrap_or(true);
+                if needs_render {
+                    let cancel = Arc::new(AtomicBool::new(false));
+                    current_cancel = Some(cancel.clone());
+                    latest_generation.insert(path.clone(), current_generation);
                     let _ = job_tx.send(Job {
                         path: path.clone(),
-                        kind,
-                        target: fast_target,
-                        tier: Tier::Fast,
-                        cancel: cancel.clone(),
-                        generation: current_generation,
-                    });
-                }
-                if !has_full {
-                    let _ = job_tx.send(Job {
-                        path: path.clone(),
-                        kind,
                         target,
-                        tier: Tier::Full,
                         cancel,
                         generation: current_generation,
                     });
@@ -195,8 +163,7 @@ pub fn run(app: &mut App) -> Result<()> {
                         if handle_key(app, key) == Action::Quit { break; }
                     }
                     Event::Resize(_, _) => {
-                        // Next loop iteration recomputes target and may re-enqueue jobs
-                        // (subject to TARGET_DEBOUNCE).
+                        // Next loop iteration recomputes target and may re-enqueue jobs.
                     }
                     _ => {}
                 }
@@ -209,7 +176,6 @@ pub fn run(app: &mut App) -> Result<()> {
         }
     }
 
-    // Tell the worker to exit; its thread will wake on the next recv() error.
     drop(job_tx);
     Ok(())
 }
@@ -229,22 +195,23 @@ fn spawn_worker(rx: Receiver<Job>, tx: Sender<JobDone>) {
         while let Ok(job) = rx.recv() {
             let Job {
                 path,
-                kind,
                 target,
-                tier,
                 cancel,
                 generation,
             } = job;
             let result = if cancel.load(Ordering::Relaxed) {
                 Err(DevelopError::Cancelled)
             } else {
-                darkroom::develop_to_rgb(&path, kind, target, Some(&cancel))
+                match decode(&path) {
+                    Ok(loaded) => develop_culling(&loaded, target, Some(&cancel)),
+                    Err(e) => Err(DevelopError::Decode(e)),
+                }
             };
             if tx
                 .send(JobDone {
                     path,
-                    tier,
                     generation,
+                    target,
                     result,
                 })
                 .is_err()
@@ -257,12 +224,11 @@ fn spawn_worker(rx: Receiver<Job>, tx: Sender<JobDone>) {
 
 fn handle_job_done(
     done: JobDone,
-    cache: &mut LruCache<PathBuf, PreviewSlot>,
+    cache: &mut LruCache<PathBuf, PreviewEntry>,
     picker: &Picker,
     app: &mut App,
     latest_generation: &HashMap<PathBuf, u64>,
 ) {
-    // Drop results from prior generations — the user has moved on.
     if latest_generation.get(&done.path).copied() != Some(done.generation) {
         return;
     }
@@ -276,22 +242,9 @@ fn handle_job_done(
                         proto: picker.new_resize_protocol(DynamicImage::ImageRgb8(buf)),
                         src_w: w,
                         src_h: h,
+                        rendered_target: done.target,
                     };
-                    let slot = cache.get_or_insert_mut(done.path.clone(), || PreviewSlot {
-                        fast: None,
-                        full: None,
-                    });
-                    match done.tier {
-                        Tier::Fast => {
-                            if slot.full.is_none() {
-                                slot.fast = Some(entry);
-                            }
-                        }
-                        Tier::Full => {
-                            slot.full = Some(entry);
-                            slot.fast = None;
-                        }
-                    }
+                    cache.put(done.path.clone(), entry);
                     if app
                         .status
                         .as_deref()
@@ -315,7 +268,7 @@ fn handle_job_done(
 fn draw(
     frame: &mut ratatui::Frame,
     app: &mut App,
-    cache: &mut LruCache<PathBuf, PreviewSlot>,
+    cache: &mut LruCache<PathBuf, PreviewEntry>,
     font_size: (u16, u16),
 ) {
     match app.view {
@@ -414,8 +367,5 @@ fn now_unix() -> i64 {
 }
 
 pub(crate) fn resize_strategy() -> Resize {
-    // Scale (not Fit) so the fast-tier preview, whose source is much smaller than the
-    // preview area, is upscaled to fill the same display rect as the full-tier preview.
-    // Both tiers therefore have identical display size; they differ only in sharpness.
     Resize::Scale(None)
 }

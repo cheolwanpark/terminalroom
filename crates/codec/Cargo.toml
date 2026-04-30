@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 image.workspace = true
 jpeg-decoder.workspace = true
+kamadak-exif.workspace = true
 libraw-rs.workspace = true
 
 [dev-dependencies]
