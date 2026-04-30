@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/libraw-rs",
+    "crates/codec",
     "crates/darkroom",
     "crates/terminalroom",
 ]
@@ -14,8 +15,12 @@ rust-version = "1.92"
 [workspace.dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
+codec = { path = "crates/codec" }
+crossbeam-channel = "0.5"
 crossterm = "0.28"
+fast_image_resize = "6"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff"] }
+jpeg-decoder = { version = "0.3", default-features = false }
 libraw-rs = { path = "crates/libraw-rs" }
 lru = "0.12"
 ratatui = "0.29"

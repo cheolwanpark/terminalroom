@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result, anyhow, bail};
-use darkroom::format::{ImageKind, classify};
+use darkroom::{ImageKind, classify};
 
 #[derive(Debug)]
 pub struct Session {

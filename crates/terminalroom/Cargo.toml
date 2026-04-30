@@ -8,8 +8,10 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+crossbeam-channel.workspace = true
 crossterm.workspace = true
 darkroom = { path = "../darkroom" }
+image.workspace = true
 lru.workspace = true
 ratatui.workspace = true
 ratatui-image.workspace = true

@@ -1,9 +1,10 @@
-use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_ushort};
+use std::ffi::{CStr, CString, c_char, c_double, c_int, c_uint, c_ushort};
 use std::fmt;
 use std::mem::size_of;
 use std::path::Path;
 use std::ptr::NonNull;
 use std::slice;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -16,24 +17,44 @@ pub struct RawMetadata {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PreviewImage {
+pub struct LinearImage {
+    pub width: u32,
+    pub height: u32,
+    /// 3-channel RGB, sRGB primaries, gamma 1.0 (linear), 16 bits per channel,
+    /// row-major, host byte order. `data.len() == width * height * 3`.
+    pub data: Vec<u16>,
+}
+
+/// JPEG bytes extracted from a RAW container's embedded thumbnail. Camera-encoded,
+/// already display-referred (sRGB / camera profile). Decoder-agnostic: the buffer
+/// is exactly what the camera wrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddedJpeg {
+    /// Width reported by libraw's thumbnail header. May be 0 if libraw did not
+    /// populate it; in that case the decoder reads the SOI marker.
     pub width: u32,
     pub height: u32,
     pub bytes: Vec<u8>,
-    pub format: PreviewFormat,
-    pub source: PreviewSource,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PreviewFormat {
-    Jpeg,
-    Rgb8 { colors: u8, bits_per_channel: u8 },
+pub struct LinearOptions {
+    /// When true, libraw subsamples to half each dimension (1/4 pixel count).
+    pub half_size: bool,
+    /// When true, apply the camera-stored white balance.
+    pub use_camera_wb: bool,
+    /// Demosaic interpolation quality: 0 = bilinear (fast), 1 = VNG, 2 = PPG, 3 = AHD.
+    pub user_qual: u8,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PreviewSource {
-    EmbeddedThumbnail,
-    ProcessedRaw,
+impl Default for LinearOptions {
+    fn default() -> Self {
+        Self {
+            half_size: false,
+            use_camera_wb: true,
+            user_qual: 3,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -42,12 +63,12 @@ pub enum Error {
     PathContainsNul,
     InitFailed,
     OpenFailed { code: i32, message: String },
-    UnpackThumbFailed { code: i32, message: String },
-    MakeMemThumbFailed { code: i32, message: String },
     UnpackFailed { code: i32, message: String },
     ProcessFailed { code: i32, message: String },
     MakeMemImageFailed { code: i32, message: String },
-    UnsupportedPreviewFormat(i32),
+    UnsupportedOutput { colors: u8, bits_per_channel: u8 },
+    BufferTooSmall { expected: usize, got: usize },
+    Cancelled,
 }
 
 impl fmt::Display for Error {
@@ -59,12 +80,6 @@ impl fmt::Display for Error {
             Error::OpenFailed { code, message } => {
                 write!(f, "LibRaw failed to open file ({code}): {message}")
             }
-            Error::UnpackThumbFailed { code, message } => {
-                write!(f, "LibRaw failed to unpack thumbnail ({code}): {message}")
-            }
-            Error::MakeMemThumbFailed { code, message } => {
-                write!(f, "LibRaw failed to materialize thumbnail ({code}): {message}")
-            }
             Error::UnpackFailed { code, message } => {
                 write!(f, "LibRaw failed to unpack RAW ({code}): {message}")
             }
@@ -74,9 +89,18 @@ impl fmt::Display for Error {
             Error::MakeMemImageFailed { code, message } => {
                 write!(f, "LibRaw failed to materialize processed image ({code}): {message}")
             }
-            Error::UnsupportedPreviewFormat(kind) => {
-                write!(f, "LibRaw returned an unsupported preview format ({kind})")
-            }
+            Error::UnsupportedOutput {
+                colors,
+                bits_per_channel,
+            } => write!(
+                f,
+                "LibRaw produced an unsupported layout: {colors} ch, {bits_per_channel} bpc"
+            ),
+            Error::BufferTooSmall { expected, got } => write!(
+                f,
+                "LibRaw output buffer too small: expected {expected} bytes, got {got}"
+            ),
+            Error::Cancelled => write!(f, "RAW decode cancelled"),
         }
     }
 }
@@ -98,42 +122,62 @@ pub fn read_metadata(path: &Path) -> Result<RawMetadata> {
     })
 }
 
-pub fn read_preview(path: &Path) -> Result<PreviewImage> {
+/// Read the camera's embedded thumbnail. Returns `Ok(None)` when no JPEG thumb
+/// is available (the file may carry a bitmap thumb, or none at all).
+///
+/// This is a *decoding capability*, not a preview policy: the caller decides
+/// whether the thumbnail is useful for the resolution it needs.
+pub fn read_embedded_jpeg(path: &Path) -> Result<Option<EmbeddedJpeg>> {
     let handle = RawHandle::open(path)?;
 
-    if let Some(preview) = try_thumbnail(&handle)? {
-        return Ok(preview);
-    }
-
-    read_processed_raw(&handle)
-}
-
-fn try_thumbnail(handle: &RawHandle) -> Result<Option<PreviewImage>> {
     let code = unsafe { ffi::libraw_unpack_thumb(handle.as_ptr()) };
     if code != 0 {
+        // No accessible thumb (typical: file has none, or unsupported variant).
         return Ok(None);
     }
 
     let mut errc: c_int = 0;
     let raw = unsafe { ffi::libraw_dcraw_make_mem_thumb(handle.as_ptr(), &mut errc) };
     let img = match NonNull::new(raw) {
-        Some(ptr) => OwnedProcessedImage { ptr },
-        None => {
-            if errc != 0 {
-                return Err(Error::MakeMemThumbFailed {
-                    code: errc,
-                    message: libraw_error_message(errc),
-                });
-            }
-            return Ok(None);
-        }
+        Some(p) => OwnedProcessedImage { ptr: p },
+        None => return Ok(None),
     };
 
-    let preview = build_preview(&img, PreviewSource::EmbeddedThumbnail)?;
-    Ok(Some(preview))
+    let header = unsafe { img.header() };
+    if header.type_ != ffi::LIBRAW_IMAGE_JPEG {
+        // Bitmap thumbnails aren't useful here; the linear path is faster than
+        // marshalling raw RGB bytes only to gamma-encode them again.
+        return Ok(None);
+    }
+
+    let bytes = unsafe { img.bytes() }.to_vec();
+    Ok(Some(EmbeddedJpeg {
+        width: header.width as u32,
+        height: header.height as u32,
+        bytes,
+    }))
 }
 
-fn read_processed_raw(handle: &RawHandle) -> Result<PreviewImage> {
+pub fn read_linear(
+    path: &Path,
+    opts: &LinearOptions,
+    cancel: Option<&AtomicBool>,
+) -> Result<LinearImage> {
+    check_cancel(cancel)?;
+    let handle = RawHandle::open(path)?;
+
+    unsafe {
+        ffi::libraw_set_output_bps(handle.as_ptr(), 16);
+        ffi::libraw_set_gamma(handle.as_ptr(), 0, 1.0);
+        ffi::libraw_set_gamma(handle.as_ptr(), 1, 1.0);
+        ffi::libraw_set_no_auto_bright(handle.as_ptr(), 1);
+        ffi::libraw_set_output_color(handle.as_ptr(), 1);
+        ffi::libraw_set_demosaic(handle.as_ptr(), opts.user_qual as c_int);
+        ffi::tr_set_half_size(handle.as_ptr(), opts.half_size as c_int);
+        ffi::tr_set_use_camera_wb(handle.as_ptr(), opts.use_camera_wb as c_int);
+    }
+
+    check_cancel(cancel)?;
     let code = unsafe { ffi::libraw_unpack(handle.as_ptr()) };
     if code != 0 {
         return Err(Error::UnpackFailed {
@@ -142,6 +186,7 @@ fn read_processed_raw(handle: &RawHandle) -> Result<PreviewImage> {
         });
     }
 
+    check_cancel(cancel)?;
     let code = unsafe { ffi::libraw_dcraw_process(handle.as_ptr()) };
     if code != 0 {
         return Err(Error::ProcessFailed {
@@ -150,6 +195,7 @@ fn read_processed_raw(handle: &RawHandle) -> Result<PreviewImage> {
         });
     }
 
+    check_cancel(cancel)?;
     let mut errc: c_int = 0;
     let raw = unsafe { ffi::libraw_dcraw_make_mem_image(handle.as_ptr(), &mut errc) };
     let img = NonNull::new(raw)
@@ -159,29 +205,49 @@ fn read_processed_raw(handle: &RawHandle) -> Result<PreviewImage> {
             message: libraw_error_message(errc),
         })?;
 
-    build_preview(&img, PreviewSource::ProcessedRaw)
-}
-
-fn build_preview(img: &OwnedProcessedImage, source: PreviewSource) -> Result<PreviewImage> {
     let header = unsafe { img.header() };
-    let format = match header.type_ {
-        ffi::LIBRAW_IMAGE_JPEG => PreviewFormat::Jpeg,
-        ffi::LIBRAW_IMAGE_BITMAP => PreviewFormat::Rgb8 {
+    if header.colors != 3 || header.bits != 16 {
+        return Err(Error::UnsupportedOutput {
             colors: header.colors as u8,
             bits_per_channel: header.bits as u8,
-        },
-        other => return Err(Error::UnsupportedPreviewFormat(other)),
-    };
+        });
+    }
 
-    let bytes = unsafe { img.bytes() }.to_vec();
+    let width = header.width as u32;
+    let height = header.height as u32;
+    let expected_pixels = (width as usize)
+        .saturating_mul(height as usize)
+        .saturating_mul(3);
+    let expected_bytes = expected_pixels.saturating_mul(2);
+    let bytes = unsafe { img.bytes() };
+    if bytes.len() < expected_bytes {
+        return Err(Error::BufferTooSmall {
+            expected: expected_bytes,
+            got: bytes.len(),
+        });
+    }
 
-    Ok(PreviewImage {
-        width: header.width as u32,
-        height: header.height as u32,
-        bytes,
-        format,
-        source,
+    let mut data = Vec::with_capacity(expected_pixels);
+    let src = &bytes[..expected_bytes];
+    // libraw documents host byte order; reinterpret pairs as u16 native-endian.
+    for chunk in src.chunks_exact(2) {
+        data.push(u16::from_ne_bytes([chunk[0], chunk[1]]));
+    }
+
+    Ok(LinearImage {
+        width,
+        height,
+        data,
     })
+}
+
+fn check_cancel(cancel: Option<&AtomicBool>) -> Result<()> {
+    if let Some(flag) = cancel
+        && flag.load(Ordering::Relaxed)
+    {
+        return Err(Error::Cancelled);
+    }
+    Ok(())
 }
 
 unsafe fn read_make_model(handle: &RawHandle) -> (Option<String>, Option<String>) {
@@ -279,13 +345,12 @@ fn libraw_error_message(code: i32) -> String {
 }
 
 mod ffi {
-    use super::{c_char, c_int, c_uint, c_ushort};
+    use super::{c_char, c_double, c_int, c_uint, c_ushort};
 
     #[allow(non_camel_case_types)]
     pub enum libraw_data_t {}
 
     pub const LIBRAW_IMAGE_JPEG: c_int = 1;
-    pub const LIBRAW_IMAGE_BITMAP: c_int = 2;
 
     #[repr(C)]
     #[allow(non_camel_case_types)]
@@ -318,20 +383,28 @@ mod ffi {
         pub fn libraw_get_iheight(data: *mut libraw_data_t) -> c_int;
         pub fn libraw_get_iparams(data: *mut libraw_data_t) -> *const libraw_iparams_t;
 
-        pub fn libraw_unpack_thumb(data: *mut libraw_data_t) -> c_int;
-        pub fn libraw_dcraw_make_mem_thumb(
-            data: *mut libraw_data_t,
-            errc: *mut c_int,
-        ) -> *mut libraw_processed_image_t;
-
         pub fn libraw_unpack(data: *mut libraw_data_t) -> c_int;
+        pub fn libraw_unpack_thumb(data: *mut libraw_data_t) -> c_int;
         pub fn libraw_dcraw_process(data: *mut libraw_data_t) -> c_int;
         pub fn libraw_dcraw_make_mem_image(
             data: *mut libraw_data_t,
             errc: *mut c_int,
         ) -> *mut libraw_processed_image_t;
-
+        pub fn libraw_dcraw_make_mem_thumb(
+            data: *mut libraw_data_t,
+            errc: *mut c_int,
+        ) -> *mut libraw_processed_image_t;
         pub fn libraw_dcraw_clear_mem(img: *mut libraw_processed_image_t);
+
+        pub fn libraw_set_demosaic(data: *mut libraw_data_t, value: c_int);
+        pub fn libraw_set_output_color(data: *mut libraw_data_t, value: c_int);
+        pub fn libraw_set_output_bps(data: *mut libraw_data_t, value: c_int);
+        pub fn libraw_set_gamma(data: *mut libraw_data_t, index: c_int, value: c_double);
+        pub fn libraw_set_no_auto_bright(data: *mut libraw_data_t, value: c_int);
+
+        // Custom C wrappers (wrapper.c): expose params fields lacking public setters.
+        pub fn tr_set_half_size(data: *mut libraw_data_t, value: c_int);
+        pub fn tr_set_use_camera_wb(data: *mut libraw_data_t, value: c_int);
     }
 }
 
@@ -392,10 +465,43 @@ mod tests {
     }
 
     #[test]
-    fn read_preview_on_missing_file_returns_open_error() {
+    fn read_linear_on_missing_file_returns_open_error() {
         let path = missing_path();
-        let err = read_preview(&path).unwrap_err();
+        let err = read_linear(&path, &LinearOptions::default(), None).unwrap_err();
         assert!(matches!(err, Error::OpenFailed { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn read_embedded_jpeg_on_missing_file_returns_open_error() {
+        let path = missing_path();
+        let err = read_embedded_jpeg(&path).unwrap_err();
+        assert!(matches!(err, Error::OpenFailed { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn read_linear_pre_open_cancel_returns_cancelled() {
+        let path = missing_path();
+        let flag = AtomicBool::new(true);
+        let err = read_linear(&path, &LinearOptions::default(), Some(&flag)).unwrap_err();
+        assert!(matches!(err, Error::Cancelled), "got {err:?}");
+    }
+
+    #[test]
+    fn libraw_setters_smoke_test() {
+        // Confirm all setters are linkable and do not crash on a fresh handle.
+        let ptr = unsafe { ffi::libraw_init(0) };
+        assert!(!ptr.is_null());
+        unsafe {
+            ffi::libraw_set_output_bps(ptr, 16);
+            ffi::libraw_set_gamma(ptr, 0, 1.0);
+            ffi::libraw_set_gamma(ptr, 1, 1.0);
+            ffi::libraw_set_no_auto_bright(ptr, 1);
+            ffi::libraw_set_output_color(ptr, 1);
+            ffi::libraw_set_demosaic(ptr, 0);
+            ffi::tr_set_half_size(ptr, 1);
+            ffi::tr_set_use_camera_wb(ptr, 1);
+            ffi::libraw_close(ptr);
+        }
     }
 
     #[test]

@@ -139,12 +139,16 @@ q          quit
 
 When the selected file changes:
 
-1. Show cached preview immediately if available.
-2. Otherwise dispatch by `ImageKind`:
-   - `Raw` → load an embedded thumbnail through `libraw-rs`; if extraction fails, fall back to the processed preview path.
-   - `Jpeg`/`Png`/`Tiff` → load directly via `image::ImageReader::open` with format-guessing.
-3. Insert the decoded image into the LRU preview cache (capacity 9, keyed by canonical path).
-4. If loading fails, show a text placeholder in the image area and surface the error in the status line.
+1. Show whatever the cache already holds for the new file (full tier preferred, then fast tier).
+2. Bump a per-selection generation and flip the prior selection's cancel flag, then enqueue two jobs to the worker thread for the new file: a fast tier at `target/4` (1/16 px) and a full tier at preview-area-px size. Both share an `Arc<AtomicBool>` cancel flag.
+3. The worker calls `darkroom::develop_to_rgb`, which dispatches via `codec::decode`:
+   - `Raw` → try `libraw_rs::read_embedded_jpeg` first (camera's JPEG thumb, fast); fall back to `read_linear` + demosaic when no thumb is available.
+   - `Jpeg` → `jpeg-decoder` with IDCT `.scale()` to the target size.
+   - `Png` / `Tiff` → `image::ImageReader::open` then full decode.
+   EXIF orientation is read at decode time and applied so portraits render upright.
+4. Results land in the LRU preview cache (capacity 9, keyed by canonical path) as `PreviewSlot { fast, full }`. Stale results from prior generations are dropped on receive.
+5. The image area renders the cached preview at a centered aspect-fit sub-rect — landscape uses the full preview width centered vertically, portrait uses the full preview height centered horizontally. Both tiers display at the same size; they differ only in source resolution / sharpness.
+6. If decoding fails, the cache stays empty for that file and a text placeholder is shown with the error surfaced in the status line.
 
 ## Acceptance Criteria
 

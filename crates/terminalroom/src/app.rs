@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use anyhow::{Result, bail};
 
-use darkroom::format::ImageKind;
+use darkroom::ImageKind;
 
 use crate::db::{CullingState, Db, FileRecord};
 use crate::session::{DiscoveredFile, Session};

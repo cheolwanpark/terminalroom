@@ -7,3 +7,6 @@ rust-version.workspace = true
 build = "build.rs"
 
 [dependencies]
+
+[build-dependencies]
+cc = "1"
