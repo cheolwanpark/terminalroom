@@ -67,7 +67,8 @@ impl Db {
     fn with_connection(conn: Connection) -> Result<Self> {
         conn.execute_batch(
             "PRAGMA foreign_keys = ON;\n\
-             PRAGMA journal_mode = WAL;",
+             PRAGMA journal_mode = WAL;\n\
+             PRAGMA busy_timeout = 5000;",
         )?;
         let mut db = Self { conn };
         db.migrate()?;

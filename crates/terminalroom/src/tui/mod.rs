@@ -86,6 +86,28 @@ struct JobDone {
     meta: Option<FileMeta>,
 }
 
+/// Persistence work routed to the save worker. The worker owns its own `Db`
+/// connection and a clone of the on-disk cache, so the UI thread never
+/// blocks on `fs::sync_all` or SQLite during a knob tick.
+enum SaveMsg {
+    /// Persist updated develop knobs for `file_id`. The matching in-memory
+    /// commit happens on the UI thread immediately before this is sent.
+    Params {
+        file_id: i64,
+        params: DevelopParams,
+        fp: u64,
+        now: i64,
+    },
+    /// Persist a freshly-rendered preview into the on-disk cache.
+    CacheBlob {
+        path: PathBuf,
+        source_fp: u64,
+        params_fp: u64,
+        srgb: Srgb8,
+        now: i64,
+    },
+}
+
 /// Worker → main message about prepared-source cache state. Main keeps a
 /// `HashSet<PathBuf>` of paths the worker currently has decoded so the
 /// debounce can switch to `DEBOUNCE_HOT` on cache hits.
@@ -153,10 +175,22 @@ pub fn run(app: &mut App, disk_cache: DiskCache) -> Result<()> {
         }
     };
 
-    let (job_tx, job_rx) = crossbeam_channel::unbounded::<Job>();
+    // Develop job channel is bounded(1) so the queue can hold at most "the
+    // next pending job" while one is in flight. The cancel-flag pattern
+    // (current_cancel) supersedes stale work, so a try_send that fails
+    // because the channel is full just means the most recent dispatch
+    // already covers the latest selection.
+    let (job_tx, job_rx) = crossbeam_channel::bounded::<Job>(1);
     let (done_tx, done_rx) = crossbeam_channel::unbounded::<JobDone>();
     let (event_tx, event_rx) = crossbeam_channel::unbounded::<Event>();
     let (cache_tx, cache_rx) = crossbeam_channel::unbounded::<CacheEvent>();
+    let (save_tx, save_rx) = crossbeam_channel::unbounded::<SaveMsg>();
+
+    // Save worker owns its own Db connection and a clone of the disk cache.
+    // WAL + busy_timeout (set in `Db::with_connection`) lets it write
+    // concurrently with the main thread's reads/touch_access calls.
+    let save_db = crate::db::Db::open_global().context("failed to open save-worker DB")?;
+    let save_handle = spawn_save_worker(save_rx, save_db, disk_cache.clone());
 
     spawn_event_thread(event_tx);
     spawn_worker(job_rx, done_tx, cache_tx);
@@ -176,6 +210,22 @@ pub fn run(app: &mut App, disk_cache: DiskCache) -> Result<()> {
     let mut hot_paths: HashSet<PathBuf> = HashSet::new();
 
     loop {
+        // 0. Drain all queued input events first. With OS key-repeat at
+        //    ~30 Hz, holding j/k produces a burst that would otherwise force
+        //    one render-decision + terminal.draw per event; coalescing folds
+        //    the burst into a single iteration. Any further events that
+        //    arrive while we render get caught by the next iteration's drain
+        //    or the recv(event_rx) arm in select!.
+        match drain_input_events(app, &event_rx, &save_tx) {
+            EventDrain::Quit => {
+                if pending_develop_change(app) {
+                    flush_pending_develop(app, &save_tx, now_unix());
+                }
+                break;
+            }
+            EventDrain::Continue => {}
+        }
+
         // 1. Pending-edit detection. The timer resets on every fingerprint
         //    change; once the user stops adjusting and the active debounce
         //    elapses, we flush. Debounce is tiered: hot paths (worker has
@@ -200,7 +250,7 @@ pub fn run(app: &mut App, disk_cache: DiskCache) -> Result<()> {
         // 2. Debounced flush: persist pending edits + commit once the timer
         //    has lain idle for the active debounce window.
         if pending && params_dirty_at.is_some_and(|t| t.elapsed() >= active_debounce) {
-            flush_pending_develop(app, now_unix());
+            flush_pending_develop(app, &save_tx, now_unix());
             params_dirty_at = None;
             last_dirty_fp = None;
         }
@@ -249,7 +299,11 @@ pub fn run(app: &mut App, disk_cache: DiskCache) -> Result<()> {
                         let cancel = Arc::new(AtomicBool::new(false));
                         current_cancel = Some(cancel.clone());
                         latest_generation.insert(path.clone(), current_generation);
-                        let _ = job_tx.send(Job {
+                        // Bounded(1) channel: if full, the queued job is
+                        // already stale (its cancel will be flipped on the
+                        // next iteration anyway). The next iteration's
+                        // render-decision will retry with the latest state.
+                        let _ = job_tx.try_send(Job {
                             path: path.clone(),
                             target,
                             cancel,
@@ -289,19 +343,18 @@ pub fn run(app: &mut App, disk_cache: DiskCache) -> Result<()> {
 
         select! {
             recv(event_rx) -> ev => {
+                // Process this single event inline; siblings that arrive
+                // while we're working are caught by the next iteration's
+                // drain at the top of the loop.
                 let Ok(ev) = ev else { break; };
-                match ev {
-                    Event::Key(key) if key.kind == KeyEventKind::Press => {
-                        if handle_key(app, key) == Action::Quit {
-                            // Force-flush any pending knob edits before exiting.
-                            if pending_develop_change(app) {
-                                flush_pending_develop(app, now_unix());
-                            }
-                            break;
-                        }
+                if let Event::Key(key) = ev
+                    && key.kind == KeyEventKind::Press
+                    && handle_key(app, key, &save_tx) == Action::Quit
+                {
+                    if pending_develop_change(app) {
+                        flush_pending_develop(app, &save_tx, now_unix());
                     }
-                    Event::Resize(_, _) => {}
-                    _ => {}
+                    break;
                 }
             }
             recv(done_rx) -> done => {
@@ -309,7 +362,7 @@ pub fn run(app: &mut App, disk_cache: DiskCache) -> Result<()> {
                 handle_job_done(
                     done,
                     &mut mem_cache,
-                    &disk_cache,
+                    &save_tx,
                     &picker,
                     app,
                     &latest_generation,
@@ -326,7 +379,13 @@ pub fn run(app: &mut App, disk_cache: DiskCache) -> Result<()> {
         }
     }
 
+    // Shutdown discipline: drop the worker channel so the develop thread
+    // exits, then drop the save channel and join the save worker so any
+    // pending DB writes / disk-cache blobs land before the alternate-screen
+    // guard tears down.
     drop(job_tx);
+    drop(save_tx);
+    let _ = save_handle.join();
     Ok(())
 }
 
@@ -338,7 +397,10 @@ fn pending_develop_change(app: &App) -> bool {
     current_fp != entry.develop_params_fp
 }
 
-fn flush_pending_develop(app: &mut App, now: i64) {
+/// Commit pending knob edits in-memory immediately and queue the persistent
+/// write for the save worker. Returns without blocking on disk; if the user
+/// quits, the save worker is joined so this write still lands.
+fn flush_pending_develop(app: &mut App, save_tx: &Sender<SaveMsg>, now: i64) {
     let Some(entry) = app.current() else { return };
     let id = entry.id;
     let current_fp = app.develop_params.fingerprint();
@@ -346,14 +408,15 @@ fn flush_pending_develop(app: &mut App, now: i64) {
         return;
     }
     let params = app.develop_params.clone();
-    match app.db.update_params(id, &params, current_fp, now) {
-        Ok(()) => {
-            app.commit_develop_params(current_fp);
-        }
-        Err(e) => {
-            app.status = Some(format!("failed to save knobs: {e}"));
-        }
-    }
+    // In-memory first so subsequent renders see the new fp without waiting
+    // on the DB. The save worker handles the actual write asynchronously.
+    app.commit_develop_params(current_fp);
+    let _ = save_tx.send(SaveMsg::Params {
+        file_id: id,
+        params,
+        fp: current_fp,
+        now,
+    });
 }
 
 fn install_in_memory(
@@ -385,6 +448,69 @@ fn install_in_memory(
     } else {
         app.status = Some("preview error: rgb buffer shape mismatch".into());
     }
+}
+
+/// Result of [`drain_input_events`]: whether the loop should keep going or
+/// exit because the user pressed quit.
+#[derive(PartialEq, Eq)]
+enum EventDrain {
+    Continue,
+    Quit,
+}
+
+/// Apply every queued input event without blocking. Returns [`EventDrain::Quit`]
+/// if any handler signaled quit (caller is responsible for the flush + break).
+fn drain_input_events(
+    app: &mut App,
+    event_rx: &Receiver<Event>,
+    save_tx: &Sender<SaveMsg>,
+) -> EventDrain {
+    while let Ok(ev) = event_rx.try_recv() {
+        if let Event::Key(key) = ev
+            && key.kind == KeyEventKind::Press
+            && handle_key(app, key, save_tx) == Action::Quit
+        {
+            return EventDrain::Quit;
+        }
+    }
+    EventDrain::Continue
+}
+
+/// Spawn the save worker. Owns its own `Db` connection and a clone of the
+/// disk cache; closes when its receiver returns Err (i.e. the sender is
+/// dropped). The returned handle is joined on shutdown so pending writes
+/// land before the alternate-screen guard tears down.
+fn spawn_save_worker(
+    rx: Receiver<SaveMsg>,
+    mut db: crate::db::Db,
+    disk_cache: DiskCache,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        while let Ok(msg) = rx.recv() {
+            match msg {
+                SaveMsg::Params {
+                    file_id,
+                    params,
+                    fp,
+                    now,
+                } => {
+                    // Errors are not surfaced to the UI thread in v1; WAL +
+                    // busy_timeout makes failures rare. The next successful
+                    // write recovers the row.
+                    let _ = db.update_params(file_id, &params, fp, now);
+                }
+                SaveMsg::CacheBlob {
+                    path,
+                    source_fp,
+                    params_fp,
+                    srgb,
+                    now,
+                } => {
+                    let _ = disk_cache.insert(&path, source_fp, params_fp, &srgb, &mut db, now);
+                }
+            }
+        }
+    })
 }
 
 fn spawn_event_thread(tx: Sender<Event>) {
@@ -540,7 +666,7 @@ fn file_meta_from(loaded: &Loaded, size_bytes: u64) -> FileMeta {
 fn handle_job_done(
     done: JobDone,
     mem_cache: &mut LruCache<PathBuf, PreviewEntry>,
-    disk_cache: &DiskCache,
+    save_tx: &Sender<SaveMsg>,
     picker: &Picker,
     app: &mut App,
     latest_generation: &HashMap<PathBuf, u64>,
@@ -555,17 +681,17 @@ fn handle_job_done(
 
     match done.result {
         Ok(rgb) => {
-            // Persist to on-disk cache before consuming the buffer.
-            if let Err(e) = disk_cache.insert(
-                &done.path,
-                done.source_fp,
-                done.params_fingerprint,
-                &rgb,
-                &mut app.db,
-                now_unix(),
-            ) {
-                app.status = Some(format!("cache write failed: {e}"));
-            }
+            // Update the in-memory cache first so the screen refreshes
+            // immediately. The on-disk write is shipped to the save worker
+            // (which owns its own Db connection), so we don't pay for
+            // fs::sync_all on the UI thread.
+            let blob = SaveMsg::CacheBlob {
+                path: done.path.clone(),
+                source_fp: done.source_fp,
+                params_fp: done.params_fingerprint,
+                srgb: rgb.clone(),
+                now: now_unix(),
+            };
             install_in_memory(
                 mem_cache,
                 picker,
@@ -575,6 +701,7 @@ fn handle_job_done(
                 rgb,
                 app,
             );
+            let _ = save_tx.send(blob);
         }
         Err(DevelopError::Cancelled) => {}
         Err(e) => {
@@ -652,49 +779,49 @@ enum Action {
     Quit,
 }
 
-fn handle_key(app: &mut App, key: KeyEvent) -> Action {
+fn handle_key(app: &mut App, key: KeyEvent, save_tx: &Sender<SaveMsg>) -> Action {
     match app.view {
         View::Filter => handle_filter_key(app, key.code),
         View::Main => match app.focus {
-            Focus::Navigation => handle_navigation_key(app, key),
-            Focus::Develop => handle_develop_key(app, key.code),
+            Focus::Navigation => handle_navigation_key(app, key, save_tx),
+            Focus::Develop => handle_develop_key(app, key.code, save_tx),
         },
     }
 }
 
-fn handle_navigation_key(app: &mut App, key: KeyEvent) -> Action {
+fn handle_navigation_key(app: &mut App, key: KeyEvent, save_tx: &Sender<SaveMsg>) -> Action {
     let now = now_unix();
     match key.code {
         KeyCode::Char('q') => return Action::Quit,
         KeyCode::Char('j') | KeyCode::Down => {
-            flush_pending_develop(app, now);
+            flush_pending_develop(app, save_tx, now);
             app.next();
         }
         KeyCode::Char('k') | KeyCode::Up => {
-            flush_pending_develop(app, now);
+            flush_pending_develop(app, save_tx, now);
             app.prev();
         }
         KeyCode::Char('x') => {
-            flush_pending_develop(app, now);
+            flush_pending_develop(app, save_tx, now);
             app.remove_current(now);
         }
         // Lowercase 'r' restores the current entry (no-op if not removed).
         // Uppercase 'R' toggles "show removed" view. crossterm sends 'R' as
         // Char('R') with KeyModifiers::SHIFT.
         KeyCode::Char('r') => {
-            flush_pending_develop(app, now);
+            flush_pending_develop(app, save_tx, now);
             app.restore_current(now);
         }
         KeyCode::Char('R') => {
-            flush_pending_develop(app, now);
+            flush_pending_develop(app, save_tx, now);
             app.toggle_show_removed();
         }
         KeyCode::Char('f') => {
-            flush_pending_develop(app, now);
+            flush_pending_develop(app, save_tx, now);
             app.open_filter();
         }
         KeyCode::Enter => {
-            flush_pending_develop(app, now);
+            flush_pending_develop(app, save_tx, now);
             app.enter_develop();
         }
         _ => {}
@@ -702,11 +829,11 @@ fn handle_navigation_key(app: &mut App, key: KeyEvent) -> Action {
     Action::Continue
 }
 
-fn handle_develop_key(app: &mut App, code: KeyCode) -> Action {
+fn handle_develop_key(app: &mut App, code: KeyCode, save_tx: &Sender<SaveMsg>) -> Action {
     match code {
         KeyCode::Char('q') => return Action::Quit,
         KeyCode::Esc => {
-            flush_pending_develop(app, now_unix());
+            flush_pending_develop(app, save_tx, now_unix());
             app.exit_develop();
         }
         KeyCode::Char('j') | KeyCode::Down => app.develop_next(),

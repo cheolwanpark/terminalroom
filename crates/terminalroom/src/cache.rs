@@ -29,6 +29,7 @@ const VERSION: u16 = 1;
 const HEADER_LEN: usize = 40;
 const DEFAULT_MAX_ENTRIES: usize = 500;
 
+#[derive(Clone)]
 pub struct Cache {
     dir: PathBuf,
     max_entries: usize,
