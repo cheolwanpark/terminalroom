@@ -56,6 +56,11 @@ const PREVIEW_CACHE_CAP: usize = 15;
 /// Capacity of the worker-side prepared-source cache. Each entry holds a
 /// target-sized `Buffer<CameraLinear>` (~18-36 MB at typical preview sizes).
 const SOURCE_CACHE_CAP: usize = 3;
+/// While the cursor is changing faster than this, skip foreground develop
+/// dispatch and prefetch — both would only be cancelled as the user keeps
+/// scrolling. Once the cursor sits still for `NAV_SETTLE`, the next
+/// iteration kicks off the real preview for whatever the cursor is on.
+const NAV_SETTLE: Duration = Duration::from_millis(150);
 const TAB_WIDTH: u16 = 28;
 const SIDE_RESERVED_COLS: u16 = TAB_WIDTH * 3 + 2;
 const STATUS_RESERVED_ROWS: u16 = 1 + 2;
@@ -228,6 +233,10 @@ pub fn run(app: &mut App, disk_cache: DiskCache) -> Result<()> {
     // flag for that job; we flip it when the path falls outside the cursor±1
     // window. Removed when the matching JobDone arrives or on cancellation.
     let mut prefetch_cancels: HashMap<PathBuf, Arc<AtomicBool>> = HashMap::new();
+    // Set whenever the cursor jumps to a new file; used to gate develop
+    // dispatch + prefetch on a brief settle window so a held key burst
+    // doesn't queue 30 jobs that all immediately get cancelled.
+    let mut last_cursor_change_at: Option<Instant> = None;
 
     loop {
         // 0. Drain all queued input events first. With OS key-repeat at
@@ -295,34 +304,53 @@ pub fn run(app: &mut App, disk_cache: DiskCache) -> Result<()> {
         let selection_changed = current_id != last_id;
         let render_fp_changed = render_fp != last_rendered_fp;
 
+        // Track when the cursor last jumped. When the user holds j/k the
+        // cursor changes every iteration; this timer keeps refreshing and
+        // we suppress develop work until it stops moving.
+        if selection_changed {
+            last_cursor_change_at = Some(Instant::now());
+        }
+        let nav_settled = last_cursor_change_at
+            .map(|t| t.elapsed() >= NAV_SETTLE)
+            .unwrap_or(true);
+
         if (selection_changed || target_changed || render_fp_changed) && current_id.is_some() {
             if let (Some(path), Some(src_fp), Some(rfp)) =
                 (current_path.clone(), current_source_fp, render_fp)
             {
-                // Cancel any in-flight job from the prior generation.
+                // Cancel any in-flight job from the prior generation. Always
+                // do this so a stale develop doesn't land after the user has
+                // moved on.
                 if let Some(c) = current_cancel.take() {
                     c.store(true, Ordering::Relaxed);
                 }
-                current_generation = current_generation.saturating_add(1);
 
                 let in_memory_hit = mem_cache.peek(&path).is_some_and(|e| {
                     !target_changed_meaningfully(e.rendered_target, target)
                         && e.params_fingerprint == rfp
                 });
 
+                // A "resolved" iteration is one where we either found the
+                // preview (mem/disk hit) or actually dispatched a develop
+                // job. Only on resolved iterations do we update the
+                // last_target/last_id/last_rendered_fp markers — otherwise
+                // the next iteration sees selection_changed again and
+                // retries once nav_settled flips true.
+                let mut resolved = in_memory_hit;
+
                 if !in_memory_hit {
                     if let Some(srgb8) =
                         disk_cache.get(&path, src_fp, rfp, &mut app.db, now_unix())
                     {
                         install_in_memory(&mut mem_cache, &picker, &path, target, rfp, srgb8, app);
-                    } else {
+                        resolved = true;
+                    } else if nav_settled {
+                        // Settled: dispatch a real develop job for the
+                        // current cursor.
+                        current_generation = current_generation.saturating_add(1);
                         let cancel = Arc::new(AtomicBool::new(false));
                         current_cancel = Some(cancel.clone());
                         latest_generation.insert(path.clone(), current_generation);
-                        // Bounded(1) channel: if full, the queued job is
-                        // already stale (its cancel will be flipped on the
-                        // next iteration anyway). The next iteration's
-                        // render-decision will retry with the latest state.
                         let _ = job_tx.try_send(Job {
                             path: path.clone(),
                             target,
@@ -334,24 +362,33 @@ pub fn run(app: &mut App, disk_cache: DiskCache) -> Result<()> {
                             size_bytes: size_now,
                             kind: JobKind::Foreground,
                         });
+                        resolved = true;
                     }
+                    // else: still scrolling — defer dispatch to the next
+                    // iteration after NAV_SETTLE elapses. The preview pane
+                    // will show whatever's in mem_cache for the current
+                    // cursor (or "loading…" on a miss) until then.
                 }
 
-                last_target = Some(target);
-                last_id = current_id;
-                last_rendered_fp = render_fp;
+                if resolved {
+                    last_target = Some(target);
+                    last_id = current_id;
+                    last_rendered_fp = render_fp;
+                }
             }
 
-            // After the foreground dispatch, prune stale prefetch jobs and
-            // queue prefetches for cursor±1 (best-effort; the worker drains
-            // foreground first).
-            update_prefetch(
-                app,
-                target,
-                &mem_cache,
-                &mut prefetch_cancels,
-                &prefetch_tx,
-            );
+            // Prefetch ±1 only when settled — during a burst the window
+            // moves every iteration, so any prefetch we queue would be
+            // cancelled on the next tick anyway.
+            if nav_settled {
+                update_prefetch(
+                    app,
+                    target,
+                    &mem_cache,
+                    &mut prefetch_cancels,
+                    &prefetch_tx,
+                );
+            }
         } else if selection_changed {
             // No current selection (empty list) — clear tracking.
             last_id = current_id;
@@ -364,14 +401,21 @@ pub fn run(app: &mut App, disk_cache: DiskCache) -> Result<()> {
             .draw(|frame| draw(frame, app, &mut mem_cache, font_size))
             .context("failed to draw frame")?;
 
-        // 5. Wait for events, bounding the timeout by the remaining debounce.
-        let timeout = match params_dirty_at {
-            Some(t) => active_debounce
-                .saturating_sub(t.elapsed())
-                .min(TICK)
-                .max(Duration::from_millis(5)),
-            None => TICK,
-        };
+        // 5. Wait for events, bounding the timeout by the remaining debounce
+        //    and (if a navigation burst is in progress) by the remaining
+        //    settle window so we can pick up dispatch as soon as the cursor
+        //    stops moving.
+        let mut timeout = TICK;
+        if let Some(t) = params_dirty_at {
+            timeout = timeout.min(active_debounce.saturating_sub(t.elapsed()));
+        }
+        if let Some(t) = last_cursor_change_at {
+            let remaining = NAV_SETTLE.saturating_sub(t.elapsed());
+            if !remaining.is_zero() {
+                timeout = timeout.min(remaining);
+            }
+        }
+        let timeout = timeout.max(Duration::from_millis(5));
 
         select! {
             recv(event_rx) -> ev => {
