@@ -8,8 +8,9 @@ previews under `~/.terminalroom/cache/`.
 
 ```
 ~/.terminalroom/
-  db.sqlite              # global file metadata + per-file develop knobs + removed flag
+  db.sqlite              # global file metadata + per-file develop knobs + removed flag + look library
   cache/<key>.cache      # one developed-preview file per cached entry (binary, see below)
+  looks/*.xmp            # XMP sidecars the user has added; the Looks modal reconciles this dir
 ```
 
 The DB is created on first run; `~/.terminalroom/` and `~/.terminalroom/cache/`
@@ -19,15 +20,16 @@ desired.
 
 ## Schema Versioning
 
-`PRAGMA user_version` drives migrations. Version `1` is the current schema.
+`PRAGMA user_version` drives migrations. Version `2` is the current schema.
 
 On startup:
 
 1. Open or create the DB.
 2. Read `PRAGMA user_version`.
-3. If `0`, create the v1 schema in one transaction and set `user_version = 1`.
-4. If `1`, continue.
-5. If greater than the app supports, exit with a clear error.
+3. If `0`, apply v1 then v2 in one transaction and set `user_version = 2`.
+4. If `1`, apply v2 in one transaction and set `user_version = 2`.
+5. If `2`, continue.
+6. If greater than the app supports, exit with a clear error.
 
 ## v1 Schema
 
@@ -35,7 +37,7 @@ On startup:
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 PRAGMA busy_timeout = 5000;
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;
 
 CREATE TABLE files (
     id                            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -57,10 +59,36 @@ CREATE INDEX idx_files_last_access ON files(last_access_unix_seconds);
 CREATE INDEX idx_files_cache_key   ON files(cache_key) WHERE cache_key IS NOT NULL;
 ```
 
-`develop_params_json` carries the full `DevelopParams` struct as JSON. The
-fingerprint column is stored separately so cache validation never has to parse
-JSON. The knob set evolves over time — using JSON keeps the schema stable as
-new knobs are added.
+`develop_params_json` carries the full `DevelopParams` struct as JSON (5
+fields after the v2 redesign: `exposure_ev`, `temperature_kelvin`, `tint`,
+`look`, `look_strength`). The fingerprint column is stored separately so
+cache validation never has to parse JSON. Old v1 rows that include the
+deprecated knob fields (`warmth`, `color`, `contrast`, `soft_highlights`,
+`shadows`, `blacks`, `clarity`, `grain`, `grain_seed`) deserialize fine —
+serde silently drops the extras, and the next flush rewrites the row in
+the new shape. No explicit JSON migration is required.
+
+## v2 Schema
+
+```sql
+CREATE TABLE looks (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    slug            TEXT    NOT NULL UNIQUE,    -- "xmp:<source_fp_hex>"; matches DevelopParams::look
+    name            TEXT    NOT NULL,           -- <crs:Name><rdf:li> or filename fallback
+    source_path     TEXT    NOT NULL,           -- absolute path inside ~/.terminalroom/looks/
+    xmp_xml         TEXT    NOT NULL,           -- raw XML, source of truth for re-parsing
+    source_fp       INTEGER NOT NULL UNIQUE,    -- u64 hash(size, mtime); same family as files.source_fingerprint
+    created_at      INTEGER NOT NULL
+);
+
+CREATE INDEX idx_looks_name ON looks(name);
+```
+
+`looks.slug` is the value carried in `DevelopParams::look`; resolution
+happens in `darkroom::LookRegistry`. Re-importing the same XMP produces the
+same slug (deterministic from file content), so any file's `develop_params`
+that referenced a deleted-then-re-added look self-heals. `xmp_xml` is the
+source of truth — the parsed recipe is rebuilt from it on every App init.
 
 The TUI runs two `Db` connections concurrently: one on the UI thread for
 synchronous `set_removed` and disk-cache `touch_access`, and one inside a
@@ -137,11 +165,28 @@ from the row's stored value, `cache_key` is set to NULL (the develop pipeline
 will repopulate). Develop params are kept across source changes — the user's
 edits don't depend on file contents.
 
+## Looks Library
+
+`~/.terminalroom/looks/` is the watch directory. Drop XMP sidecars there
+(e.g. exported from Lightroom / Camera Raw); the Looks modal scans this
+directory on every open and reconciles it against the `looks` table:
+
+- new `*.xmp` files are parsed and inserted (slug = `xmp:<source_fp_hex>`);
+- DB rows whose `source_path` no longer exists on disk are deleted;
+- the in-memory `LookRegistry` is rebuilt from the surviving rows.
+
+Parse failures are skipped with a status-bar notice; they never crash the
+TUI. Files are referenced by their content fingerprint, so renaming an XMP
+preserves identity (the fp survives) while editing it produces a new slug
+(the fp changes).
+
 ## Future Extensions
 
 Likely future columns / tables:
 
-- A separate `looks` table for user-defined Look presets.
 - Per-file tags or workflow metadata.
+- An "actual XMP→pixels" applier replacing the current `ApplyXmp` no-op
+  stub. Will likely add a parsed-recipe cache column or a dedicated
+  pre-rendered LUT table; out of scope for v2.
 
-Don't add these in v1.
+Don't add these in v2.

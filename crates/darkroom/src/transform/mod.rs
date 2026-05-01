@@ -33,3 +33,4 @@ pub mod camera;
 pub mod encode;
 pub mod matrix;
 pub mod oklab;
+pub mod xmp;

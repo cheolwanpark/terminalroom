@@ -51,12 +51,12 @@ fn shortcuts(focus: Focus, show_removed: bool) -> &'static str {
     match focus {
         Focus::Navigation => {
             if show_removed {
-                "j/k navigate · x remove · r restore · R show-removed:on · f filter · enter develop · q quit"
+                "j/k navigate · x remove · r restore · R show-removed:on · f filter · L looks · enter develop · q quit"
             } else {
-                "j/k navigate · x remove · r restore · R show-removed:off · f filter · enter develop · q quit"
+                "j/k navigate · x remove · r restore · R show-removed:off · f filter · L looks · enter develop · q quit"
             }
         }
-        Focus::Develop => "j/k knob · h/l adjust · r reset · esc back · q quit",
+        Focus::Develop => "j/k knob · h/l adjust · r reset · enter looks · esc back · q quit",
     }
 }
 

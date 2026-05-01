@@ -28,6 +28,7 @@ kamadak-exif = "0.6"
 libraw-rs = { path = "crates/libraw-rs" }
 lru = "0.12"
 pulp = "0.18"
+quick-xml = "0.36"
 ratatui = "0.29"
 ratatui-image = "4"
 rusqlite = { version = "0.32", features = ["bundled"] }

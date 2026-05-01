@@ -27,18 +27,20 @@ use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::StatefulProtocol;
 
 use darkroom::{
-    DevelopError, DevelopParams, ImageKind, Loaded, PreparedSource, Srgb8, TargetSize,
-    apply_pipeline, decode, prepare_source,
+    DevelopError, DevelopParams, ImageKind, Loaded, LookRegistry, PreparedSource, Srgb8,
+    TargetSize, apply_pipeline, decode, prepare_source,
 };
 
-use crate::app::{App, FileMeta, Focus, View};
+use crate::app::{App, DevelopKnob, FileMeta, Focus, View, DEVELOP_KNOBS};
 use crate::cache::Cache as DiskCache;
+use crate::paths;
 
 mod banner;
 mod develop;
 mod filmstrip;
 mod filter;
 mod info;
+mod looks;
 mod preview;
 mod status;
 
@@ -109,6 +111,10 @@ struct Job {
     source_fp: u64,
     size_bytes: u64,
     kind: JobKind,
+    /// Snapshot of the look registry at dispatch time. Cloning the `Arc` is
+    /// O(1); the worker uses it inside `apply_pipeline` to resolve the look
+    /// id stored in `params.look`.
+    look_registry: Arc<LookRegistry>,
 }
 
 struct JobDone {
@@ -259,6 +265,12 @@ pub fn run(app: &mut App, disk_cache: DiskCache) -> Result<()> {
     // doesn't flash the preview through every previously-cached file the
     // cursor scrolls over.
     let mut displayed_path: Option<PathBuf> = None;
+    // Tracks the previous frame's view. When it transitions modal→Main the
+    // loop calls `terminal.clear()` to force a full redraw — ratatui-image's
+    // kitty backend leaves stale image fragments on screen after a Clear
+    // overlay if we only rely on buffer-diff updates. The clear forces every
+    // cell (including kitty placeholders) to re-emit on the next draw.
+    let mut prev_view = app.view;
 
     loop {
         // 0. Drain all queued input events first. With OS key-repeat at
@@ -398,6 +410,7 @@ pub fn run(app: &mut App, disk_cache: DiskCache) -> Result<()> {
                             source_fp: src_fp,
                             size_bytes: size_now,
                             kind: JobKind::Foreground,
+                            look_registry: Arc::clone(&app.look_registry),
                         });
                         resolved = true;
                     }
@@ -443,7 +456,22 @@ pub fn run(app: &mut App, disk_cache: DiskCache) -> Result<()> {
             displayed_path = Some(curr_path.clone());
         }
 
-        // 4. Draw.
+        // 4. Draw. On a modal→Main transition (Filter/Looks modal closing),
+        //    force ratatui to repaint every cell from scratch. ratatui's
+        //    diff would otherwise treat the modal-overlapped cells as
+        //    already-correct (its previous-buffer reflects what we wrote,
+        //    not what the terminal actually rendered), leaving stale
+        //    modal pixels visible. We don't touch `mem_cache` or kitty's
+        //    image storage — the StatefulProtocol re-emits its placeholders
+        //    on every render call, and the kitty image stays in terminal
+        //    storage across `\x1b[2J`, so placeholders re-bind to it once
+        //    the next draw runs.
+        if prev_view != View::Main && app.view == View::Main {
+            terminal
+                .clear()
+                .context("failed to clear terminal on modal close")?;
+        }
+        prev_view = app.view;
         let font_size = picker.font_size();
         terminal
             .draw(|frame| draw(frame, app, &mut mem_cache, displayed_path.as_deref(), font_size))
@@ -873,6 +901,7 @@ fn process_job(
         source_fp,
         size_bytes,
         kind,
+        look_registry,
     } = job;
 
     if cancel.load(Ordering::Relaxed) {
@@ -948,7 +977,7 @@ fn process_job(
         }
     };
 
-    let result = apply_pipeline(&prepared, &params, Some(&cancel));
+    let result = apply_pipeline(&prepared, &params, &look_registry, Some(&cancel));
     tx.send(JobDone {
         path,
         generation,
@@ -1104,6 +1133,7 @@ fn update_prefetch(
             source_fp: entry.source_fp,
             size_bytes: entry.file.size_bytes,
             kind: JobKind::Prefetch,
+            look_registry: Arc::clone(&app.look_registry),
         });
     }
 }
@@ -1142,6 +1172,8 @@ fn draw(
 
     if app.view == View::Filter {
         filter::render(frame, app);
+    } else if app.view == View::Looks {
+        looks::render(frame, app);
     }
 }
 
@@ -1172,7 +1204,7 @@ fn target_changed_meaningfully(prev: TargetSize, next: TargetSize) -> bool {
     diff(prev.max_w, next.max_w) || diff(prev.max_h, next.max_h)
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 enum Action {
     Continue,
     Quit,
@@ -1181,6 +1213,7 @@ enum Action {
 fn handle_key(app: &mut App, key: KeyEvent, save_tx: &Sender<SaveMsg>) -> Action {
     match app.view {
         View::Filter => handle_filter_key(app, key.code),
+        View::Looks => handle_looks_key(app, key.code, save_tx),
         View::Main => match app.focus {
             Focus::Navigation => handle_navigation_key(app, key, save_tx),
             Focus::Develop => handle_develop_key(app, key.code, save_tx),
@@ -1219,6 +1252,10 @@ fn handle_navigation_key(app: &mut App, key: KeyEvent, save_tx: &Sender<SaveMsg>
             flush_pending_develop(app, save_tx, now);
             app.open_filter();
         }
+        KeyCode::Char('L') => {
+            flush_pending_develop(app, save_tx, now);
+            open_looks_modal(app, now);
+        }
         KeyCode::Enter => {
             flush_pending_develop(app, save_tx, now);
             app.enter_develop();
@@ -1240,6 +1277,24 @@ fn handle_develop_key(app: &mut App, code: KeyCode, save_tx: &Sender<SaveMsg>) -
         KeyCode::Char('h') | KeyCode::Left => app.develop_adjust(-1.0),
         KeyCode::Char('l') | KeyCode::Right => app.develop_adjust(1.0),
         KeyCode::Char('r') => app.develop_reset(),
+        KeyCode::Char('L') => {
+            // Capital L opens the Looks modal from either focus, so users
+            // don't have to remember which focus they're in.
+            let now = now_unix();
+            flush_pending_develop(app, save_tx, now);
+            open_looks_modal(app, now);
+        }
+        KeyCode::Enter => {
+            // Enter on the LookSelector knob opens the Looks modal.
+            // Anywhere else, Enter is inert.
+            if let Some(&(_, knob)) = DEVELOP_KNOBS.get(app.develop_cursor) {
+                if knob == DevelopKnob::LookSelector {
+                    let now = now_unix();
+                    flush_pending_develop(app, save_tx, now);
+                    open_looks_modal(app, now);
+                }
+            }
+        }
         _ => {}
     }
     Action::Continue
@@ -1255,6 +1310,31 @@ fn handle_filter_key(app: &mut App, code: KeyCode) -> Action {
         _ => {}
     }
     Action::Continue
+}
+
+fn handle_looks_key(app: &mut App, code: KeyCode, _save_tx: &Sender<SaveMsg>) -> Action {
+    match code {
+        KeyCode::Char('j') | KeyCode::Down => app.looks_next(),
+        KeyCode::Char('k') | KeyCode::Up => app.looks_prev(),
+        KeyCode::Enter => {
+            app.looks_apply_to_current();
+            app.close_looks();
+        }
+        KeyCode::Esc | KeyCode::Char('L') => app.close_looks(),
+        _ => {}
+    }
+    Action::Continue
+}
+
+/// Resolve the watch directory and ask `App` to reconcile + open the modal.
+/// On directory-resolution failure, surface an error in the status line and
+/// don't open the modal (no point in showing an empty list with no way to
+/// discover XMPs).
+fn open_looks_modal(app: &mut App, now: i64) {
+    match paths::looks_dir() {
+        Ok(dir) => app.open_looks(&dir, now),
+        Err(e) => app.status = Some(format!("looks dir unavailable: {e}")),
+    }
 }
 
 fn now_unix() -> i64 {
@@ -1276,5 +1356,150 @@ pub(crate) fn tab_block(title: &'static str, focused: bool) -> Block<'static> {
             .border_style(Style::default().fg(Color::Yellow));
     }
     block
+}
+
+#[cfg(test)]
+mod dispatch_tests {
+    //! Integration-style tests that route a `KeyEvent` through `handle_key`
+    //! to verify the modal dispatch chain end-to-end. Caught by these
+    //! tests: any future regression where opening the Looks modal silently
+    //! routes keys to navigation/develop instead.
+    use super::*;
+    use crate::app::App;
+    use crate::db::Db;
+    use crate::session::{DiscoveredFile, Session};
+    use crossterm::event::KeyModifiers;
+    use darkroom::ImageKind;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    fn build_app() -> (App, Arc<crossbeam_channel::Sender<SaveMsg>>) {
+        let mut db = Db::open_in_memory().unwrap();
+        let f = DiscoveredFile {
+            canonical_path: PathBuf::from("/t/a.cr3"),
+            display_name: "a.cr3".into(),
+            size_bytes: 100,
+            modified_unix_seconds: 1000,
+            kind: ImageKind::Raw,
+        };
+        let row = db.upsert_file(&f, 1000).unwrap();
+        let session = Session {
+            root: PathBuf::from("/t"),
+            files: vec![f],
+        };
+        let app = App::init(session, db, vec![row]).unwrap();
+        let (tx, _rx) = crossbeam_channel::unbounded::<SaveMsg>();
+        (app, Arc::new(tx))
+    }
+
+    fn k(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn looks_modal_consumes_navigation_keys_not_main_view() {
+        let (mut app, save_tx) = build_app();
+        // Manually open the modal. (open_looks_modal calls paths::looks_dir
+        // which would create real ~/.terminalroom/looks — bypass that here.)
+        app.view = crate::app::View::Looks;
+        // Inject two fake registered looks so j/k actually has somewhere to go.
+        app.looks = vec![
+            crate::db::LookRow {
+                id: 1, slug: "xmp:1".into(), name: "Alpha".into(),
+                source_path: PathBuf::from("/dev/null"), xmp_xml: "".into(),
+                source_fp: 1, created_at_unix_seconds: 0,
+            },
+            crate::db::LookRow {
+                id: 2, slug: "xmp:2".into(), name: "Beta".into(),
+                source_path: PathBuf::from("/dev/null"), xmp_xml: "".into(),
+                source_fp: 2, created_at_unix_seconds: 0,
+            },
+        ];
+        let cursor_before_file = app.cursor;
+        app.looks_cursor = 0;
+
+        // j routes to handle_looks_key (because view is Looks), not to
+        // handle_navigation_key — verify by checking app.cursor (file cursor)
+        // is unchanged while looks_cursor advances.
+        let action = handle_key(&mut app, k(KeyCode::Char('j')), &save_tx);
+        assert_eq!(action, Action::Continue);
+        assert_eq!(
+            app.cursor, cursor_before_file,
+            "file cursor must not move while modal is open"
+        );
+        assert_eq!(app.looks_cursor, 1, "j should advance looks cursor");
+
+        // k moves back.
+        handle_key(&mut app, k(KeyCode::Char('k')), &save_tx);
+        assert_eq!(app.looks_cursor, 0);
+
+        // Down/Up alternate forms.
+        handle_key(&mut app, k(KeyCode::Down), &save_tx);
+        assert_eq!(app.looks_cursor, 1);
+        handle_key(&mut app, k(KeyCode::Up), &save_tx);
+        assert_eq!(app.looks_cursor, 0);
+    }
+
+    #[test]
+    fn looks_modal_enter_applies_and_closes() {
+        let (mut app, save_tx) = build_app();
+        app.view = crate::app::View::Looks;
+        app.looks = vec![crate::db::LookRow {
+            id: 1, slug: "xmp:1".into(), name: "Alpha".into(),
+            source_path: PathBuf::from("/dev/null"), xmp_xml: "".into(),
+            source_fp: 1, created_at_unix_seconds: 0,
+        }];
+        app.looks_cursor = 1; // pointing at the first registered look
+
+        handle_key(&mut app, k(KeyCode::Enter), &save_tx);
+        assert_eq!(app.view, crate::app::View::Main, "Enter should close modal");
+        assert_eq!(app.develop_params.look, "xmp:1", "Enter should apply slug");
+    }
+
+    #[test]
+    fn looks_modal_esc_closes_without_applying() {
+        let (mut app, save_tx) = build_app();
+        app.view = crate::app::View::Looks;
+        let look_before = app.develop_params.look.clone();
+        handle_key(&mut app, k(KeyCode::Esc), &save_tx);
+        assert_eq!(app.view, crate::app::View::Main);
+        assert_eq!(app.develop_params.look, look_before);
+    }
+
+    #[test]
+    fn looks_modal_l_key_closes() {
+        let (mut app, save_tx) = build_app();
+        app.view = crate::app::View::Looks;
+        handle_key(&mut app, k(KeyCode::Char('L')), &save_tx);
+        assert_eq!(app.view, crate::app::View::Main);
+    }
+
+
+    #[test]
+    fn keys_route_to_navigation_when_modal_closed() {
+        let (mut app, save_tx) = build_app();
+        // Add a second file so j has somewhere to go.
+        let f2 = DiscoveredFile {
+            canonical_path: PathBuf::from("/t/b.cr3"),
+            display_name: "b.cr3".into(),
+            size_bytes: 100,
+            modified_unix_seconds: 1000,
+            kind: ImageKind::Raw,
+        };
+        let row2 = app.db.upsert_file(&f2, 1000).unwrap();
+        app.files.push(crate::app::FileEntry {
+            id: row2.id, file: f2, removed: false,
+            develop_params: row2.develop_params.clone(),
+            develop_params_fp: row2.develop_params_fp,
+            source_fp: row2.source_fp,
+        });
+        app.rebuild_visible();
+        app.cursor = 0;
+
+        // view=Main, focus=Navigation, j should advance file cursor.
+        let action = handle_key(&mut app, k(KeyCode::Char('j')), &save_tx);
+        assert_eq!(action, Action::Continue);
+        assert_eq!(app.cursor, 1, "j in nav focus should advance file cursor");
+    }
 }
 

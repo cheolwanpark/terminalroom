@@ -33,7 +33,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
     let items: Vec<ListItem> = DEVELOP_KNOBS
         .iter()
         .map(|(label, knob)| {
-            let value = knob.format(&app.develop_params);
+            let value = knob.format(&app.develop_params, &app.looks);
             let line = Line::from(vec![
                 Span::styled(format!("{:<width$}", label, width = label_w), label_style),
                 Span::styled(value, value_style),

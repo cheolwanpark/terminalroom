@@ -28,7 +28,21 @@ CREATE INDEX IF NOT EXISTS idx_files_last_access ON files(last_access_unix_secon
 CREATE INDEX IF NOT EXISTS idx_files_cache_key   ON files(cache_key) WHERE cache_key IS NOT NULL;
 "#;
 
-const SUPPORTED_VERSION: i32 = 1;
+const SCHEMA_V2: &str = r#"
+CREATE TABLE IF NOT EXISTS looks (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    slug            TEXT    NOT NULL UNIQUE,
+    name            TEXT    NOT NULL,
+    source_path     TEXT    NOT NULL,
+    xmp_xml         TEXT    NOT NULL,
+    source_fp       INTEGER NOT NULL UNIQUE,
+    created_at      INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_looks_name ON looks(name);
+"#;
+
+const SUPPORTED_VERSION: i32 = 2;
 
 /// Per-file row materialized into Rust types.
 #[derive(Clone, Debug)]
@@ -42,6 +56,19 @@ pub struct FileRow {
     pub develop_params: DevelopParams,
     pub develop_params_fp: u64,
     pub cache_key: Option<String>,
+}
+
+/// One stored XMP-driven look. The slug `"xmp:<source_fp_hex>"` is the value
+/// carried in `DevelopParams::look` and resolved by `darkroom::LookRegistry`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LookRow {
+    pub id: i64,
+    pub slug: String,
+    pub name: String,
+    pub source_path: PathBuf,
+    pub xmp_xml: String,
+    pub source_fp: u64,
+    pub created_at_unix_seconds: i64,
 }
 
 #[derive(Debug)]
@@ -84,6 +111,14 @@ impl Db {
             0 => {
                 let tx = self.conn.transaction()?;
                 tx.execute_batch(SCHEMA_V1)?;
+                tx.execute_batch(SCHEMA_V2)?;
+                tx.execute_batch(&format!("PRAGMA user_version = {SUPPORTED_VERSION};"))?;
+                tx.commit()?;
+                Ok(())
+            }
+            1 => {
+                let tx = self.conn.transaction()?;
+                tx.execute_batch(SCHEMA_V2)?;
                 tx.execute_batch(&format!("PRAGMA user_version = {SUPPORTED_VERSION};"))?;
                 tx.commit()?;
                 Ok(())
@@ -288,6 +323,92 @@ impl Db {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
+
+    /// Insert a new look. Errors on duplicate `slug` / `source_fp` (the unique
+    /// constraints) — caller should `find_look_by_fp` first if dedup is the
+    /// desired semantics.
+    pub fn insert_look(
+        &mut self,
+        slug: &str,
+        name: &str,
+        source_path: &Path,
+        xmp_xml: &str,
+        source_fp: u64,
+        now_unix: i64,
+    ) -> Result<LookRow> {
+        let path_str = source_path.to_str().ok_or_else(|| {
+            anyhow!("look source path is not valid UTF-8: {}", source_path.display())
+        })?;
+        self.conn.execute(
+            "INSERT INTO looks (slug, name, source_path, xmp_xml, source_fp, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![slug, name, path_str, xmp_xml, source_fp as i64, now_unix],
+        )?;
+        let id = self.conn.last_insert_rowid();
+        Ok(LookRow {
+            id,
+            slug: slug.to_string(),
+            name: name.to_string(),
+            source_path: source_path.to_path_buf(),
+            xmp_xml: xmp_xml.to_string(),
+            source_fp,
+            created_at_unix_seconds: now_unix,
+        })
+    }
+
+    /// All looks ordered by display name (case-insensitive).
+    pub fn list_looks(&self) -> Result<Vec<LookRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, slug, name, source_path, xmp_xml, source_fp, created_at
+               FROM looks
+              ORDER BY name COLLATE NOCASE ASC",
+        )?;
+        let rows = stmt
+            .query_map([], row_to_lookrow)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Lookup by content fingerprint. Used by the modal-open reconciliation
+    /// to skip re-importing an already-registered XMP.
+    pub fn find_look_by_fp(&self, source_fp: u64) -> Result<Option<LookRow>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT id, slug, name, source_path, xmp_xml, source_fp, created_at
+                   FROM looks WHERE source_fp = ?1",
+                params![source_fp as i64],
+                row_to_lookrow,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Delete one look by id. No-op if the id is absent.
+    pub fn delete_look(&mut self, id: i64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM looks WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+}
+
+fn row_to_lookrow(row: &rusqlite::Row) -> rusqlite::Result<LookRow> {
+    let id: i64 = row.get(0)?;
+    let slug: String = row.get(1)?;
+    let name: String = row.get(2)?;
+    let path: String = row.get(3)?;
+    let xml: String = row.get(4)?;
+    let fp: i64 = row.get(5)?;
+    let created: i64 = row.get(6)?;
+    Ok(LookRow {
+        id,
+        slug,
+        name,
+        source_path: PathBuf::from(path),
+        xmp_xml: xml,
+        source_fp: fp as u64,
+        created_at_unix_seconds: created,
+    })
 }
 
 fn row_to_filerow(row: &rusqlite::Row) -> rusqlite::Result<FileRow> {
@@ -345,13 +466,62 @@ mod tests {
     }
 
     #[test]
-    fn open_in_memory_sets_user_version_1() {
+    fn open_in_memory_sets_user_version_2() {
         let db = Db::open_in_memory().unwrap();
         let v: i32 = db
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 1);
+        assert_eq!(v, 2);
+    }
+
+    #[test]
+    fn migration_v0_to_v2_creates_both_tables() {
+        let db = Db::open_in_memory().unwrap();
+        // files table:
+        let files_count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='files'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(files_count, 1);
+        // looks table:
+        let looks_count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='looks'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(looks_count, 1);
+    }
+
+    #[test]
+    fn migration_v1_to_v2_creates_looks_table() {
+        // Hand-roll a v1 DB.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch("PRAGMA user_version = 1;").unwrap();
+        // Now reopen via Db::with_connection — which should run the v1→v2 migration.
+        let db = Db::with_connection(conn).unwrap();
+        let v: i32 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 2);
+        let looks_count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='looks'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(looks_count, 1);
     }
 
     #[test]
@@ -395,8 +565,8 @@ mod tests {
         let row = db.upsert_file(&make_file("/tmp/a.cr3", 100, 1000), 2000).unwrap();
         let mut p = DevelopParams::default();
         p.exposure_ev = 0.75;
-        p.warmth = -0.3;
-        p.look = "warm-muted-soft".to_string();
+        p.tint = -0.3;
+        p.look = "xmp:deadbeef".to_string();
         let fp = p.fingerprint();
         db.update_params(row.id, &p, fp, 3000).unwrap();
         let loaded = db
@@ -404,8 +574,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(loaded.develop_params.exposure_ev, 0.75);
-        assert_eq!(loaded.develop_params.warmth, -0.3);
-        assert_eq!(loaded.develop_params.look, "warm-muted-soft");
+        assert_eq!(loaded.develop_params.tint, -0.3);
+        assert_eq!(loaded.develop_params.look, "xmp:deadbeef");
         assert_eq!(loaded.develop_params_fp, fp);
     }
 
@@ -464,5 +634,105 @@ mod tests {
         conn.execute_batch("PRAGMA user_version = 99;").unwrap();
         let err = Db::with_connection(conn).unwrap_err();
         assert!(err.to_string().contains("99"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn insert_look_then_list_round_trips() {
+        let mut db = Db::open_in_memory().unwrap();
+        let path = PathBuf::from("/tmp/look-a.xmp");
+        let row = db
+            .insert_look("xmp:abc", "Look A", &path, "<xml/>", 0xabc, 1000)
+            .unwrap();
+        assert!(row.id > 0);
+        assert_eq!(row.slug, "xmp:abc");
+        assert_eq!(row.source_fp, 0xabc);
+        let listed = db.list_looks().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0], row);
+    }
+
+    #[test]
+    fn insert_look_dedupes_on_source_fp() {
+        let mut db = Db::open_in_memory().unwrap();
+        let path = PathBuf::from("/tmp/x.xmp");
+        db.insert_look("xmp:1", "First", &path, "<xml/>", 42, 100)
+            .unwrap();
+        // Second insert with same fp must error (UNIQUE constraint).
+        let err = db
+            .insert_look("xmp:2", "Second", &path, "<xml/>", 42, 200)
+            .unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("unique"));
+    }
+
+    #[test]
+    fn find_look_by_fp_returns_row_or_none() {
+        let mut db = Db::open_in_memory().unwrap();
+        let path = PathBuf::from("/tmp/x.xmp");
+        db.insert_look("xmp:7", "L7", &path, "<xml/>", 7, 100).unwrap();
+        let found = db.find_look_by_fp(7).unwrap().unwrap();
+        assert_eq!(found.slug, "xmp:7");
+        assert!(db.find_look_by_fp(999).unwrap().is_none());
+    }
+
+    #[test]
+    fn delete_look_removes_row() {
+        let mut db = Db::open_in_memory().unwrap();
+        let path = PathBuf::from("/tmp/x.xmp");
+        let row = db
+            .insert_look("xmp:k", "K", &path, "<xml/>", 0xdead, 100)
+            .unwrap();
+        db.delete_look(row.id).unwrap();
+        assert!(db.list_looks().unwrap().is_empty());
+        // Idempotent on missing id.
+        db.delete_look(row.id).unwrap();
+    }
+
+    #[test]
+    fn list_looks_orders_by_name_case_insensitive() {
+        let mut db = Db::open_in_memory().unwrap();
+        let p = PathBuf::from("/tmp/x.xmp");
+        db.insert_look("xmp:1", "zebra", &p, "<xml/>", 1, 100).unwrap();
+        db.insert_look("xmp:2", "Apple", &p, "<xml/>", 2, 200).unwrap();
+        db.insert_look("xmp:3", "banana", &p, "<xml/>", 3, 300).unwrap();
+        let names: Vec<_> = db.list_looks().unwrap().into_iter().map(|r| r.name).collect();
+        assert_eq!(names, vec!["Apple", "banana", "zebra"]);
+    }
+
+    #[test]
+    fn develop_params_v1_json_loads_with_unknowns_dropped() {
+        let mut db = Db::open_in_memory().unwrap();
+        let row = db
+            .upsert_file(&make_file("/tmp/legacy.cr3", 100, 1000), 2000)
+            .unwrap();
+        // Hand-write a v1-shape JSON directly into the row, bypassing serde.
+        let v1 = r#"{
+            "exposure_ev": 0.5,
+            "temperature_kelvin": 5500.0,
+            "tint": 0.0,
+            "look": "identity",
+            "look_strength": 1.0,
+            "warmth": 0.7,
+            "color": -0.3,
+            "contrast": 0.2,
+            "soft_highlights": 0.1,
+            "shadows": -0.4,
+            "blacks": 0.0,
+            "clarity": 0.5,
+            "grain": 0.0,
+            "grain_seed": 42
+        }"#;
+        db.conn
+            .execute(
+                "UPDATE files SET develop_params_json = ?1 WHERE id = ?2",
+                params![v1, row.id],
+            )
+            .unwrap();
+        let loaded = db
+            .load_for_path(&PathBuf::from("/tmp/legacy.cr3"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.develop_params.exposure_ev, 0.5);
+        assert_eq!(loaded.develop_params.look, "identity");
+        assert_eq!(loaded.develop_params.look_strength, 1.0);
     }
 }

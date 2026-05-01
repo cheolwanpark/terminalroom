@@ -30,6 +30,10 @@ Linking should prefer the thread-safe LibRaw variant where the platform exposes 
 
 `jpeg-decoder = "0.3"` decodes standalone JPEG files for the image-format input pipeline. It is preferred over the JPEG path inside the `image` crate (which uses `zune-jpeg`) because it exposes `Decoder::scale(target_w, target_h)` — IDCT-based sub-resolution decode at factor 1/2/4/8. For terminal-sized previews this is dramatically cheaper than decoding at native resolution and downscaling.
 
+## quick-xml
+
+`quick-xml = "0.36"` parses XMP sidecars in `darkroom::transform::xmp::parse_xmp`. Streaming pull-style reader, no DOM allocation per element — the parser walks events once and pattern-matches `crs:` attributes off `<rdf:Description>` plus the `<crs:ToneCurvePV2012*>/<rdf:Seq>/<rdf:li>` curve points. The parser is intentionally permissive: an unrecognized `crs:` attribute is silently ignored, and a stray non-XML sidecar yields the default `XmpRecipe` rather than panicking — a malformed file in `~/.terminalroom/looks/` should never crash the TUI.
+
 ## fast_image_resize
 
 `fast_image_resize = "6"` is the SIMD resampler used by `darkroom::common`. It supports SSE4.1 / AVX2 / NEON for U8x3 (interleaved sRGB) and `F32` (single-channel f32) pixel types. The default `Resizer::new()` picks the best available CPU extension and uses Lanczos3 by default.

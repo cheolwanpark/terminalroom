@@ -1,17 +1,22 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::UNIX_EPOCH;
 
 use anyhow::Result;
 
-use darkroom::{DevelopParams, ImageKind, ShotInfo};
+use darkroom::{
+    DevelopParams, IDENTITY_ID, ImageKind, LookRegistry, ShotInfo, XmpRecipe, parse_xmp,
+};
 
-use crate::db::{Db, FileRow};
+use crate::db::{Db, FileRow, LookRow};
 use crate::session::{DiscoveredFile, Session};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum View {
     Main,
     Filter,
+    Looks,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -52,15 +57,8 @@ pub const DEVELOP_KNOBS: &[(&str, DevelopKnob)] = &[
     ("Exposure", DevelopKnob::ExposureEv),
     ("Temperature", DevelopKnob::TemperatureKelvin),
     ("Tint", DevelopKnob::Tint),
+    ("Look", DevelopKnob::LookSelector),
     ("Look Strength", DevelopKnob::LookStrength),
-    ("Warmth", DevelopKnob::Warmth),
-    ("Color", DevelopKnob::Color),
-    ("Contrast", DevelopKnob::Contrast),
-    ("Soft Highlights", DevelopKnob::SoftHighlights),
-    ("Shadows", DevelopKnob::Shadows),
-    ("Blacks", DevelopKnob::Blacks),
-    ("Clarity", DevelopKnob::Clarity),
-    ("Grain", DevelopKnob::Grain),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,15 +66,10 @@ pub enum DevelopKnob {
     ExposureEv,
     TemperatureKelvin,
     Tint,
+    /// Discrete cycle through registered looks. Adjust cycles the slug;
+    /// `step`/`read`/`write` are inert (the App branches on `is_discrete`).
+    LookSelector,
     LookStrength,
-    Warmth,
-    Color,
-    Contrast,
-    SoftHighlights,
-    Shadows,
-    Blacks,
-    Clarity,
-    Grain,
 }
 
 impl DevelopKnob {
@@ -84,6 +77,7 @@ impl DevelopKnob {
         match self {
             Self::ExposureEv => 0.05,
             Self::TemperatureKelvin => 100.0,
+            Self::LookSelector => 0.0,
             _ => 0.05,
         }
     }
@@ -92,15 +86,8 @@ impl DevelopKnob {
             Self::ExposureEv => p.exposure_ev,
             Self::TemperatureKelvin => p.temperature_kelvin,
             Self::Tint => p.tint,
+            Self::LookSelector => 0.0,
             Self::LookStrength => p.look_strength,
-            Self::Warmth => p.warmth,
-            Self::Color => p.color,
-            Self::Contrast => p.contrast,
-            Self::SoftHighlights => p.soft_highlights,
-            Self::Shadows => p.shadows,
-            Self::Blacks => p.blacks,
-            Self::Clarity => p.clarity,
-            Self::Grain => p.grain,
         }
     }
     pub fn write(self, p: &mut DevelopParams, v: f32) {
@@ -108,25 +95,35 @@ impl DevelopKnob {
             Self::ExposureEv => p.exposure_ev = v.clamp(-3.0, 3.0),
             Self::TemperatureKelvin => p.temperature_kelvin = v.clamp(2000.0, 12000.0),
             Self::Tint => p.tint = v.clamp(-1.0, 1.0),
+            Self::LookSelector => {} // discrete; cycled by App::develop_adjust
             Self::LookStrength => p.look_strength = v.clamp(0.0, 1.0),
-            Self::Warmth => p.warmth = v.clamp(-1.0, 1.0),
-            Self::Color => p.color = v.clamp(-1.0, 1.0),
-            Self::Contrast => p.contrast = v.clamp(-1.0, 1.0),
-            Self::SoftHighlights => p.soft_highlights = v.clamp(0.0, 1.0),
-            Self::Shadows => p.shadows = v.clamp(-1.0, 1.0),
-            Self::Blacks => p.blacks = v.clamp(-1.0, 1.0),
-            Self::Clarity => p.clarity = v.clamp(-1.0, 1.0),
-            Self::Grain => p.grain = v.clamp(0.0, 1.0),
         }
     }
-    /// Format the value for display.
-    pub fn format(self, p: &DevelopParams) -> String {
+    /// Format the value for display. `looks` is consulted only for
+    /// `LookSelector` to resolve the current slug to a display name.
+    pub fn format(self, p: &DevelopParams, looks: &[LookRow]) -> String {
         match self {
             Self::ExposureEv => format!("{:+.2} EV", p.exposure_ev),
             Self::TemperatureKelvin => format!("{:>5.0} K", p.temperature_kelvin),
-            _ => format!("{:+.2}", self.read(p)),
+            Self::Tint => format!("{:+.2}", p.tint),
+            Self::LookSelector => format_look_value(p, looks),
+            Self::LookStrength => format!("{:+.2}", p.look_strength),
         }
     }
+    pub fn is_discrete(self) -> bool {
+        matches!(self, Self::LookSelector)
+    }
+}
+
+fn format_look_value(p: &DevelopParams, looks: &[LookRow]) -> String {
+    if p.look == IDENTITY_ID {
+        return "(none)".to_string();
+    }
+    looks
+        .iter()
+        .find(|r| r.slug == p.look)
+        .map(|r| r.name.clone())
+        .unwrap_or_else(|| "(missing)".to_string())
 }
 
 pub struct App {
@@ -147,6 +144,14 @@ pub struct App {
     pub develop_cursor: usize,
     pub file_meta: HashMap<PathBuf, FileMeta>,
     pub show_removed: bool,
+    /// All registered XMP-driven looks, sorted by name. Refreshed by
+    /// `reconcile_looks_with_dir`. Cursor 0 in the Looks modal is the
+    /// `(none)/identity` pseudo-entry; cursor `i+1` corresponds to `looks[i]`.
+    pub looks: Vec<LookRow>,
+    pub looks_cursor: usize,
+    /// Runtime registry feeding `apply_pipeline`. Replaced (Arc-on-write)
+    /// every reconcile; in-flight Jobs keep their cloned Arc.
+    pub look_registry: Arc<LookRegistry>,
 }
 
 impl App {
@@ -197,6 +202,9 @@ impl App {
             .map(|e| e.develop_params.clone())
             .unwrap_or_default();
 
+        // Seed the look registry from any persisted rows. The TUI calls
+        // `reconcile_looks_with_dir` on every modal-open to pick up filesystem
+        // changes; init only loads what's already in the DB.
         let mut app = Self {
             session_root: session.root,
             files,
@@ -213,7 +221,11 @@ impl App {
             develop_cursor: 0,
             file_meta: HashMap::new(),
             show_removed: false,
+            looks: Vec::new(),
+            looks_cursor: 0,
+            look_registry: Arc::new(LookRegistry::new()),
         };
+        app.refresh_looks_from_db();
         app.rebuild_visible_keep_path(None);
         app.sync_develop_params_from_current();
         Ok(app)
@@ -239,23 +251,65 @@ impl App {
         }
     }
 
-    /// Adjust the focused knob by `direction * step`.
+    /// Adjust the focused knob by `direction * step`, or for the discrete
+    /// `LookSelector` knob, cycle through registered looks.
     pub fn develop_adjust(&mut self, direction: f32) {
         let Some(&(_, knob)) = DEVELOP_KNOBS.get(self.develop_cursor) else {
             return;
         };
+        if knob == DevelopKnob::LookSelector {
+            self.look_selector_cycle(direction.signum() as i32);
+            return;
+        }
         let current = knob.read(&self.develop_params);
         let next = current + direction * knob.step();
         knob.write(&mut self.develop_params, next);
     }
 
-    /// Reset the focused knob to its default value.
+    /// Reset the focused knob to its default value (or to `identity` for the
+    /// `LookSelector`).
     pub fn develop_reset(&mut self) {
         let Some(&(_, knob)) = DEVELOP_KNOBS.get(self.develop_cursor) else {
             return;
         };
-        let default = knob.read(&DevelopParams::default());
-        knob.write(&mut self.develop_params, default);
+        match knob {
+            DevelopKnob::LookSelector => {
+                self.develop_params.look = IDENTITY_ID.to_string();
+            }
+            _ => {
+                let default = knob.read(&DevelopParams::default());
+                knob.write(&mut self.develop_params, default);
+            }
+        }
+    }
+
+    fn look_selector_cycle(&mut self, direction: i32) {
+        if direction == 0 {
+            return;
+        }
+        let total = 1 + self.looks.len();
+        if total == 0 {
+            return;
+        }
+        let current_idx = if self.develop_params.look == IDENTITY_ID {
+            0
+        } else {
+            self.looks
+                .iter()
+                .position(|r| r.slug == self.develop_params.look)
+                .map(|p| p + 1)
+                .unwrap_or(0)
+        };
+        let next = if direction > 0 {
+            (current_idx + 1) % total
+        } else {
+            (current_idx + total - 1) % total
+        };
+        self.develop_params.look = if next == 0 {
+            IDENTITY_ID.to_string()
+        } else {
+            self.looks[next - 1].slug.clone()
+        };
     }
 
     /// Replace `self.develop_params` with the current file's persisted params.
@@ -435,6 +489,164 @@ impl App {
     pub fn enabled_count(&self) -> usize {
         self.enabled_formats.len()
     }
+
+    /// Open the Looks modal. Reconciles the watch dir first so the list is
+    /// up-to-date on every open. Caller passes `paths::looks_dir()`.
+    pub fn open_looks(&mut self, looks_dir: &Path, now_unix: i64) {
+        self.reconcile_looks_with_dir(looks_dir, now_unix);
+        self.looks_cursor = if self.develop_params.look == IDENTITY_ID {
+            0
+        } else {
+            self.looks
+                .iter()
+                .position(|r| r.slug == self.develop_params.look)
+                .map(|p| p + 1)
+                .unwrap_or(0)
+        };
+        self.view = View::Looks;
+    }
+
+    pub fn close_looks(&mut self) {
+        self.view = View::Main;
+    }
+
+    pub fn looks_next(&mut self) {
+        let total = 1 + self.looks.len();
+        if self.looks_cursor + 1 < total {
+            self.looks_cursor += 1;
+        }
+    }
+
+    pub fn looks_prev(&mut self) {
+        if self.looks_cursor > 0 {
+            self.looks_cursor -= 1;
+        }
+    }
+
+    /// Apply the look at `looks_cursor` to the current file's live params.
+    /// The TUI's existing dirty-flag check picks up the slug change and
+    /// triggers the standard debounce → save-worker flush.
+    pub fn looks_apply_to_current(&mut self) {
+        let slug = if self.looks_cursor == 0 {
+            IDENTITY_ID.to_string()
+        } else {
+            match self.looks.get(self.looks_cursor - 1) {
+                Some(r) => r.slug.clone(),
+                None => return,
+            }
+        };
+        self.develop_params.look = slug;
+    }
+
+    /// Walk `dir` for `*.xmp` files; insert any unregistered ones into the DB,
+    /// prune DB rows whose `source_path` no longer exists, then refresh
+    /// `self.looks` and `self.look_registry`. Errors are surfaced via
+    /// `self.status` and never panic.
+    pub fn reconcile_looks_with_dir(&mut self, dir: &Path, now_unix: i64) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.filter_map(Result::ok) {
+                let path = entry.path();
+                let is_xmp = path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.eq_ignore_ascii_case("xmp"))
+                    .unwrap_or(false);
+                if !is_xmp {
+                    continue;
+                }
+                let Ok(meta) = entry.metadata() else { continue };
+                let size = meta.len() as i64;
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                let fp = crate::db::compute_source_fp(size, mtime);
+                match self.db.find_look_by_fp(fp) {
+                    Ok(Some(_)) => continue,
+                    Ok(None) => {
+                        let xml = match std::fs::read_to_string(&path) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                self.status = Some(format!(
+                                    "xmp read failed for {}: {e}",
+                                    path.display()
+                                ));
+                                continue;
+                            }
+                        };
+                        let recipe = match parse_xmp(&xml) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                self.status = Some(format!(
+                                    "xmp parse failed for {}: {e}",
+                                    path.display()
+                                ));
+                                continue;
+                            }
+                        };
+                        let _ = recipe; // recipe gets re-parsed when we rebuild the registry below
+                        let slug = format!("xmp:{:016x}", fp);
+                        let name = derive_look_name(&xml, &path);
+                        if let Err(e) = self
+                            .db
+                            .insert_look(&slug, &name, &path, &xml, fp, now_unix)
+                        {
+                            self.status = Some(format!("xmp insert failed: {e}"));
+                        }
+                    }
+                    Err(e) => {
+                        self.status = Some(format!("xmp lookup failed: {e}"));
+                    }
+                }
+            }
+        }
+
+        // Prune DB rows whose source file is gone.
+        let rows = match self.db.list_looks() {
+            Ok(r) => r,
+            Err(e) => {
+                self.status = Some(format!("list_looks failed: {e}"));
+                return;
+            }
+        };
+        for row in &rows {
+            if !row.source_path.exists() {
+                let _ = self.db.delete_look(row.id);
+            }
+        }
+
+        self.refresh_looks_from_db();
+    }
+
+    /// Reload `self.looks` from the DB and rebuild `self.look_registry`.
+    /// Parse failures on stored XML are silently skipped (the row stays in
+    /// the DB but resolves to Identity at apply time).
+    fn refresh_looks_from_db(&mut self) {
+        self.looks = self.db.list_looks().unwrap_or_default();
+        let mut reg = LookRegistry::new();
+        for row in &self.looks {
+            if let Ok(recipe) = parse_xmp(&row.xmp_xml) {
+                reg.register_xmp(row.slug.clone(), recipe);
+            }
+        }
+        self.look_registry = Arc::new(reg);
+    }
+}
+
+fn derive_look_name(xml: &str, path: &Path) -> String {
+    if let Ok(recipe) = parse_xmp(xml)
+        && let Some(name) = recipe.name
+        && !name.is_empty()
+    {
+        return name;
+    }
+    let _ = XmpRecipe::default(); // suppress dead-code if parse_xmp gets gated
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("untitled")
+        .to_string()
 }
 
 #[cfg(test)]
@@ -480,6 +692,7 @@ mod tests {
         assert_eq!(app.view, View::Main);
         assert_eq!(app.focus, Focus::Navigation);
         assert!(!app.show_removed);
+        assert!(app.looks.is_empty());
         let labels: Vec<_> = app
             .available_formats
             .iter()
@@ -594,5 +807,122 @@ mod tests {
         assert_eq!(app.view, View::Main);
         app.exit_develop();
         assert_eq!(app.focus, Focus::Navigation);
+    }
+
+    fn write_xmp(path: &Path, name: &str) -> u64 {
+        // Minimal valid-enough XMP: just <crs:Name> inside an <rdf:Description>.
+        let xml = format!(
+            r#"<?xml version="1.0"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/" rdf:about="">
+   <crs:Name>
+    <rdf:Alt>
+     <rdf:li xml:lang="x-default">{name}</rdf:li>
+    </rdf:Alt>
+   </crs:Name>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>"#
+        );
+        std::fs::write(path, &xml).unwrap();
+        let meta = std::fs::metadata(path).unwrap();
+        let mtime = meta
+            .modified()
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        crate::db::compute_source_fp(meta.len() as i64, mtime)
+    }
+
+    #[test]
+    fn reconcile_looks_with_dir_inserts_new_files() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut app = build_app(vec![file("a.cr3", ImageKind::Raw)]);
+        let xmp = tmp.path().join("preset-a.xmp");
+        let fp = write_xmp(&xmp, "Preset A");
+
+        app.reconcile_looks_with_dir(tmp.path(), 1234);
+        assert_eq!(app.looks.len(), 1);
+        let row = &app.looks[0];
+        assert_eq!(row.name, "Preset A");
+        assert_eq!(row.slug, format!("xmp:{:016x}", fp));
+        assert!(app.look_registry.is_registered(&row.slug));
+    }
+
+    #[test]
+    fn reconcile_looks_with_dir_prunes_missing_files() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut app = build_app(vec![file("a.cr3", ImageKind::Raw)]);
+        let xmp = tmp.path().join("p.xmp");
+        write_xmp(&xmp, "P");
+        app.reconcile_looks_with_dir(tmp.path(), 1234);
+        assert_eq!(app.looks.len(), 1);
+        std::fs::remove_file(&xmp).unwrap();
+        app.reconcile_looks_with_dir(tmp.path(), 1235);
+        assert!(app.looks.is_empty());
+    }
+
+    #[test]
+    fn reconcile_is_idempotent_on_unchanged_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut app = build_app(vec![file("a.cr3", ImageKind::Raw)]);
+        let xmp = tmp.path().join("p.xmp");
+        write_xmp(&xmp, "P");
+        app.reconcile_looks_with_dir(tmp.path(), 1234);
+        let before = app.looks.clone();
+        app.reconcile_looks_with_dir(tmp.path(), 5678);
+        assert_eq!(before, app.looks);
+    }
+
+    #[test]
+    fn looks_apply_to_current_sets_develop_params_look() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut app = build_app(vec![file("a.cr3", ImageKind::Raw)]);
+        // Names of different lengths — the source fingerprint hashes
+        // (size, mtime), so equal-sized files written in the same second
+        // would collide and dedupe to one entry.
+        write_xmp(&tmp.path().join("look-a.xmp"), "First Look");
+        write_xmp(&tmp.path().join("look-b.xmp"), "Second");
+        app.reconcile_looks_with_dir(tmp.path(), 1234);
+        assert_eq!(app.looks.len(), 2);
+
+        app.looks_cursor = 1; // first registered look
+        app.looks_apply_to_current();
+        assert_eq!(app.develop_params.look, app.looks[0].slug);
+
+        app.looks_cursor = 0; // identity
+        app.looks_apply_to_current();
+        assert_eq!(app.develop_params.look, IDENTITY_ID);
+    }
+
+    #[test]
+    fn look_selector_cycles_forward_then_back() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut app = build_app(vec![file("a.cr3", ImageKind::Raw)]);
+        write_xmp(&tmp.path().join("look-a.xmp"), "Alpha");
+        write_xmp(&tmp.path().join("look-b.xmp"), "Bravo Echo");
+        app.reconcile_looks_with_dir(tmp.path(), 1234);
+        assert_eq!(app.looks.len(), 2);
+
+        // Position cursor on the LookSelector knob.
+        app.develop_cursor = DEVELOP_KNOBS
+            .iter()
+            .position(|(_, k)| *k == DevelopKnob::LookSelector)
+            .unwrap();
+
+        assert_eq!(app.develop_params.look, IDENTITY_ID);
+        app.develop_adjust(1.0);
+        assert_eq!(app.develop_params.look, app.looks[0].slug);
+        app.develop_adjust(1.0);
+        assert_eq!(app.develop_params.look, app.looks[1].slug);
+        app.develop_adjust(1.0); // wrap to identity
+        assert_eq!(app.develop_params.look, IDENTITY_ID);
+        app.develop_adjust(-1.0); // wrap back to last
+        assert_eq!(app.develop_params.look, app.looks[1].slug);
+
+        app.develop_reset();
+        assert_eq!(app.develop_params.look, IDENTITY_ID);
     }
 }

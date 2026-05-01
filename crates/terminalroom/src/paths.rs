@@ -24,3 +24,13 @@ pub fn cache_dir() -> Result<PathBuf> {
         .with_context(|| format!("failed to create cache directory {}", dir.display()))?;
     Ok(dir)
 }
+
+/// `~/.terminalroom/looks/`. Watch directory for XMP sidecars; the Looks
+/// modal scans this on open and reconciles registered looks against its
+/// contents. Created on first call.
+pub fn looks_dir() -> Result<PathBuf> {
+    let dir = app_dir()?.join("looks");
+    fs::create_dir_all(&dir)
+        .with_context(|| format!("failed to create looks directory {}", dir.display()))?;
+    Ok(dir)
+}

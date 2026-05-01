@@ -66,11 +66,11 @@ The status line shows the current filename, `i/N` (where `N` is the visible coun
 Two focus modes inside the main view:
 
 - **Navigation focus** (default): keys move between images, mark them removed/restored, and toggle show-removed view.
-- **Develop focus**: keys navigate and adjust the 12 develop knobs.
+- **Develop focus**: keys navigate and adjust the 5 develop entries (Exposure, Temperature, Tint, Look, Look Strength).
 
 `Enter` in Navigation focus shifts focus to the Develop tab. `Esc` in Develop focus returns to Navigation. The active focus is indicated by the tab border (thick yellow on the focused tab; default border elsewhere) and by the shortcut hint in the status line.
 
-Focus is fully modal: image-navigation keys are inert in Develop focus, knob keys are inert in Navigation focus. The filter popup is reachable from Navigation focus only (`f`).
+Focus is fully modal: image-navigation keys are inert in Develop focus, knob keys are inert in Navigation focus. The filter popup is reachable from Navigation focus only (`f`); the Looks modal is reachable from Navigation focus (`L`) or by pressing `Enter` on the Look entry in Develop focus.
 
 ## Keybindings
 
@@ -83,6 +83,7 @@ x          mark current image as removed
 r          restore current image (no-op if not removed)
 R          toggle "show removed" (Shift+R)
 f          open format filter popup
+L          open looks modal (Shift+L)
 Enter      focus the Develop tab
 q          quit
 ```
@@ -92,9 +93,10 @@ Develop focus:
 ```text
 j / Down   focus next knob
 k / Up     focus previous knob
-h / Left   decrement focused knob by one step
-l / Right  increment focused knob by one step
-r          reset focused knob to default
+h / Left   decrement focused knob by one step (Look: cycle to previous look)
+l / Right  increment focused knob by one step (Look: cycle to next look)
+r          reset focused knob to default (Look: reset to "(none)")
+Enter      open Looks modal (only when on the Look entry; inert otherwise)
 Esc        return to Navigation focus
 q          quit
 ```
@@ -107,6 +109,16 @@ k / Up             move cursor up
 Space              toggle the highlighted format
 Enter / Esc / f    close popup
 q                  quit
+```
+
+Looks modal:
+
+```text
+j / Down       move cursor down
+k / Up         move cursor up
+Enter          apply the selected look to the current file + close
+Esc / L        close
+q              quit
 ```
 
 Navigation does not wrap around at the ends. Pressing next on the last image or previous on the first image keeps the current selection.
@@ -143,30 +155,44 @@ When the user changes state, persist it immediately to SQLite and update the sta
 
 ## Develop Tab
 
-The Develop tab is a side column in the main layout — always visible. It shows the 12 user-facing knobs grouped by function (Input → Look → Color → Tone → Detail per the design doc). The cursor highlights one knob at a time; in Develop focus, `h/l` adjusts that knob by its step, `r` resets it to default, `j/k` move between knobs. The preview re-renders whenever a knob changes (debounced through the same worker thread that handles culling — 50 ms once the worker has the source cached, 250 ms on the cold first preview).
+The Develop tab is a side column in the main layout — always visible. It shows the 5 user-facing entries (Exposure / Temperature / Tint / Look / Look Strength). The cursor highlights one entry at a time; in Develop focus, `h/l` adjusts the current entry by its step (or cycles the look for the discrete `Look` entry), `r` resets it, `j/k` move between entries, `Enter` on the `Look` entry opens the Looks modal. The preview re-renders whenever a knob changes (debounced through the same worker thread that handles culling — 50 ms once the worker has the source cached, 250 ms on the cold first preview).
 
-Knob set (display order; per-knob ranges live in `app::DevelopKnob`):
+Entry set:
 
 ```text
-Input          Exposure       (-3..+3 EV, step 0.05)
-               Temperature    (2000..12000 K, step 100)
-               Tint           (-1..+1, step 0.05)
-Look           Look Strength  (0..1, step 0.05)
-Color          Warmth         (-1..+1)
-               Color          (-1..+1)
-Tone           Contrast       (-1..+1)
-               Soft Highlights (0..1)
-               Shadows        (-1..+1)
-               Blacks         (-1..+1)
-Detail         Clarity        (-1..+1)
-               Grain          (0..1)
+Exposure        (-3..+3 EV, step 0.05)
+Temperature     (2000..12000 K, step 100)
+Tint            (-1..+1, step 0.05)
+Look            cycles through registered XMP looks; defaults to "(none)"
+Look Strength   (0..1, step 0.05; blends look ↔ neutral)
 ```
 
-Defaults are identity (every knob at zero / 5500 K / Look Strength 1.0 with `Identity` look) — the default preview is the neutral develop.
+Defaults are identity (Exposure 0, 5500 K WB, Tint 0, Look "(none)", Strength 1.0) — the default preview is the neutral develop. The eight pre-redesign knobs (Warmth, Color, Contrast, Soft Highlights, Shadows, Blacks, Clarity, Grain) are now carried inside curated XMP-driven Looks rather than surfaced as per-image sliders; see `looks.md`.
 
-When the Develop tab is **not** focused, the knob list is dimmed (no cursor symbol, dim labels and values) so the focus state is visible at a glance. When focused, labels are normal weight, values are bold, and a `▶ ` cursor marks the focused knob.
+When the Develop tab is **not** focused, the entry list is dimmed (no cursor symbol, dim labels and values) so the focus state is visible at a glance. When focused, labels are normal weight, values are bold, and a `▶ ` cursor marks the focused entry.
 
-Knob values are persisted per file in the global SQLite (`~/.terminalroom/db.sqlite`). Edits commit in-memory as soon as the tiered debounce expires (50 ms hot, 250 ms cold), and the matching SQLite write is queued for a save worker thread — the UI never blocks on disk during a knob tick. The same debounce gates re-rendering, so quickly held arrow keys settle into one re-render once you stop pressing. Force-flush points (file change, focus change, quit) route through the same async path; on quit the save worker is joined before exit so no edits are lost.
+Entry values are persisted per file in the global SQLite (`~/.terminalroom/db.sqlite`). Edits commit in-memory as soon as the tiered debounce expires (50 ms hot, 250 ms cold), and the matching SQLite write is queued for a save worker thread — the UI never blocks on disk during a knob tick. The same debounce gates re-rendering, so quickly held arrow keys settle into one re-render once you stop pressing. Force-flush points (file change, focus change, quit) route through the same async path; on quit the save worker is joined before exit so no edits are lost.
+
+## Looks Modal
+
+Press `L` from Navigation focus (or `Enter` on the `Look` entry from Develop focus) to open a centered modal listing the available looks:
+
+```text
++-- Looks --------------------------------------------------+
+| (none)                                                    |
+| Sample Positive Look                                      |
+| ...                                                       |
+|                                                           |
+| j/k navigate · enter apply · esc close ·                  |
+|     drop XMPs in ~/.terminalroom/looks/                   |
++-----------------------------------------------------------+
+```
+
+The list is filesystem-driven: drop `.xmp` sidecars into `~/.terminalroom/looks/` and they appear here on the next modal open. There is no `add` or `delete` UI inside the modal — to remove a look, delete its file from the watch directory and reopen the modal. Parse failures are skipped silently with a status-bar notice; a stray malformed sidecar never crashes the TUI.
+
+Selecting a look applies it to the current file (the slug is written to the file's `develop_params.look` and persisted via the standard debounce path). The applied look name shows up in the Develop tab's `Look` entry next time the tab is rendered.
+
+The actual XMP→pixels math is currently a stub — selecting a look persists the choice and resolves it through the pipeline, but the rendered preview is identical to identity. Roadmap and rationale: see `looks.md`.
 
 ## Image Info Tab
 
