@@ -143,7 +143,7 @@ When the user changes state, persist it immediately to SQLite and update the sta
 
 ## Develop Tab
 
-The Develop tab is a side column in the main layout — always visible. It shows the 12 user-facing knobs grouped by function (Input → Look → Color → Tone → Detail per the design doc). The cursor highlights one knob at a time; in Develop focus, `h/l` adjusts that knob by its step, `r` resets it to default, `j/k` move between knobs. The preview re-renders whenever a knob changes (debounced through the same worker thread that handles culling).
+The Develop tab is a side column in the main layout — always visible. It shows the 12 user-facing knobs grouped by function (Input → Look → Color → Tone → Detail per the design doc). The cursor highlights one knob at a time; in Develop focus, `h/l` adjusts that knob by its step, `r` resets it to default, `j/k` move between knobs. The preview re-renders whenever a knob changes (debounced through the same worker thread that handles culling — 50 ms once the worker has the source cached, 250 ms on the cold first preview).
 
 Knob set (display order; per-knob ranges live in `app::DevelopKnob`):
 
@@ -166,7 +166,7 @@ Defaults are identity (every knob at zero / 5500 K / Look Strength 1.0 with `Ide
 
 When the Develop tab is **not** focused, the knob list is dimmed (no cursor symbol, dim labels and values) so the focus state is visible at a glance. When focused, labels are normal weight, values are bold, and a `▶ ` cursor marks the focused knob.
 
-Knob values are persisted per file in the global SQLite (`~/.terminalroom/db.sqlite`). Edits commit after a 250 ms debounce on the last adjust; the same debounce gates re-rendering, so quickly held arrow keys settle into one re-render once you stop pressing. Force-flush points (file change, focus change, quit) ensure no edits are lost beyond the debounce window.
+Knob values are persisted per file in the global SQLite (`~/.terminalroom/db.sqlite`). Edits commit in-memory as soon as the tiered debounce expires (50 ms hot, 250 ms cold), and the matching SQLite write is queued for a save worker thread — the UI never blocks on disk during a knob tick. The same debounce gates re-rendering, so quickly held arrow keys settle into one re-render once you stop pressing. Force-flush points (file change, focus change, quit) route through the same async path; on quit the save worker is joined before exit so no edits are lost.
 
 ## Image Info Tab
 

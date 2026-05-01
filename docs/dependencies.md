@@ -60,16 +60,16 @@ Use ratatui as the immediate-mode terminal renderer. Every draw pass renders the
 Realized MVP structure (in `tui/`):
 
 - Terminal init/teardown via explicit crossterm calls (`enable_raw_mode`, `EnterAlternateScreen`) wrapped in a Drop guard so the terminal is restored even on panic.
-- One worker thread runs `codec::decode` + `pipeline::develop_preview` jobs from a `crossbeam_channel`; each `JobDone` also carries the parsed `FileMeta` (shot info + dims + size + kind) for the Image Info tab. One event-reader thread feeds crossterm `Event`s into another channel.
-- Main loop runs `crossbeam_channel::select!` over events, completed jobs, and a 100 ms tick (used for periodic redraw and to recompute the preview target on terminal resize).
+- One develop worker thread runs `codec::decode` + `pipeline::prepare_source` + `pipeline::apply_pipeline` jobs, draining a `bounded(1)` foreground channel via `try_recv` first and then `select!`ing over a `bounded(2)` prefetch channel; each `JobDone` carries the parsed `FileMeta` (shot info + dims + size + kind) and a `JobKind` distinguishing foreground from prefetch results. The worker keeps a private `LruCache<SourceKey, Arc<PreparedSource>>` (cap 3) so successive knob ticks on the same file skip decode + resize. One event-reader thread feeds crossterm `Event`s into another channel. One save worker thread owns its own `Db` connection (WAL + `busy_timeout = 5000`) and a `Clone` of the on-disk cache, processing `update_params` and `Cache::insert` off the UI thread.
+- Main loop drains queued events at the top of every iteration so a held key folds into one render-decision + draw, then runs `crossbeam_channel::select!` over a single event, completed jobs, source-cache events (which drive the tiered debounce decision), and a `default(timeout)` bounded by the remaining tiered debounce, the remaining 150 ms `NAV_SETTLE` window, and a 100 ms `TICK`.
 - Per-panel renderers: `banner`, `preview`, `develop`, `info`, `filmstrip`, `status`, `filter`. `tui::draw` (in `mod.rs`) lays them out as banner / main / status, where main is preview / Develop tab / Image Info tab / Navigation tab. The filter view is rendered as a `Clear`-backed modal overlay on top of the main layout when `app.view == View::Filter`.
-- Rendering functions are pure: they read from `App` and write to the `Frame`. DB writes happen in the event/loop step (`app.set_state`); preview decoding happens off-thread on the worker and lands in the cache (and `app.file_meta`) via `JobDone` messages.
+- Rendering functions are pure: they read from `App` and write to the `Frame`. UI-thread DB writes are limited to `set_removed` and disk-cache `touch_access` (on hit); hot-path writes (`update_params`, `Cache::insert`) are routed to the save worker. Preview decoding happens off-thread on the develop worker and lands in the in-memory cache (and `app.file_meta`) via `JobDone` messages.
 
 Ratatui does not own input handling. Crossterm keyboard events are dispatched on `(view, focus)` so the Develop tab is fully modal — image-navigation keys are inert in Develop focus and vice versa.
 
 ## crossbeam-channel
 
-`crossbeam-channel = "0.5"` provides the unbounded `Sender`/`Receiver` pairs and the `select!` macro the TUI uses to multiplex over events, completed jobs, and timeouts. Picked over `std::sync::mpsc` for the macro and the better receive-with-timeout ergonomics.
+`crossbeam-channel = "0.5"` provides the `Sender`/`Receiver` pairs and the `select!` macro the TUI uses to multiplex over events, completed jobs, source-cache events, and timeouts. Picked over `std::sync::mpsc` for the macro and the better receive-with-timeout ergonomics. The TUI uses a mix of channel kinds: `bounded(1)` (foreground develop jobs, with `try_send` so a full queue silently drops the would-be stale job — the cancel-flag pattern handles supersession), `bounded(2)` (prefetch jobs), and unbounded for events / done / save / source-cache events. Channels are also closed at shutdown to drive worker exit (the save worker is `join`ed before `run` returns so pending writes always land).
 
 ## ratatui-image
 
@@ -78,7 +78,7 @@ Use ratatui-image to render preview images in the terminal. It supports multiple
 Realized MVP behavior:
 
 - `Picker::from_query_stdio()` is called once at TUI startup; if it fails (terminal does not respond to the query), the TUI falls back to `Picker::from_fontsize((1, 2))` and surfaces the warning in the status line. ratatui-image then renders with halfblocks.
-- Cache is `LruCache<PathBuf, PreviewEntry>` (capacity 9). Each entry holds a `StatefulProtocol`, the source dims, the `TargetSize` it was rendered for, and the `params_fingerprint` of the `DevelopParams` that produced it. On selection change, significant target change, or knob adjustment (params fingerprint mismatch), the worker re-runs `decode` + `pipeline::develop_preview` and the result replaces the prior entry.
+- Hot-tier cache is `LruCache<PathBuf, PreviewEntry>` (capacity 15). Each entry holds a `StatefulProtocol`, the source dims, the `TargetSize` it was rendered for, and the `params_fingerprint` of the `DevelopParams` that produced it. On selection change, significant target change, or knob adjustment (params fingerprint mismatch), the worker re-runs `pipeline::apply_pipeline` against the cached `PreparedSource` (skipping decode + resize on a source-cache hit) and the result replaces the prior entry. The worker also keeps an `LruCache<SourceKey, Arc<PreparedSource>>` (cap 3) keyed by `(path, source_fp, target_bucket)` so the param-independent prefix runs at most once per source/target bucket.
 - The main image area uses `StatefulImage::default().resize(Resize::Scale(None))` — `Scale` (not `Fit`) so the same display rect is filled regardless of source resolution; the terminal-cell size of the preview is computed by `aspect_fit_rect`.
 - A centered, aspect-preserving sub-rect (`aspect_fit_rect` in `tui::preview`) is computed from `(src_w, src_h)` and `picker.font_size()`. Landscape images use full preview width and center vertically; portrait images use full preview height and center horizontally. The sub-rect — not the full preview area — is what gets passed to `StatefulImage`.
 
@@ -95,7 +95,7 @@ SQLite is the default choice because:
 - Future develop settings will likely need structured queries.
 - The culling state is small, relational, and path-oriented.
 
-Use one connection on the UI thread for the first MVP. If preview decoding moves to multiple worker threads, keep DB access on the app thread unless there is a concrete performance issue.
+Two connections are used today: one on the UI thread (for `set_removed` and the `touch_access` write inside `Cache::get` on hits), and one inside the save worker (for `update_params` and `Cache::insert`). Both open the same `~/.terminalroom/db.sqlite` and run `PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;` — WAL allows concurrent readers + one writer at a time, and the busy timeout serializes the rare write/write contention without surfacing `SQLITE_BUSY`. Routing the hot-path writes through the save worker keeps `fs::sync_all` and SQLite I/O off the UI thread during knob ticks.
 
 ## sled Comparison
 

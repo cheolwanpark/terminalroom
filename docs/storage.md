@@ -34,6 +34,7 @@ On startup:
 ```sql
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
+PRAGMA busy_timeout = 5000;
 PRAGMA user_version = 1;
 
 CREATE TABLE files (
@@ -61,6 +62,13 @@ fingerprint column is stored separately so cache validation never has to parse
 JSON. The knob set evolves over time — using JSON keeps the schema stable as
 new knobs are added.
 
+The TUI runs two `Db` connections concurrently: one on the UI thread for
+synchronous `set_removed` and disk-cache `touch_access`, and one inside a
+save worker for the hot-path writes (`update_params` and `Cache::insert`).
+WAL allows concurrent readers + one writer at a time; `busy_timeout = 5000`
+serializes the rare write/write contention without surfacing `SQLITE_BUSY`
+errors to the application.
+
 ## Selection Model
 
 There is no pick/reject/unset state. Files have a single `removed` boolean
@@ -78,10 +86,13 @@ Both `x` and `r` write synchronously through `Db::set_removed`.
 
 `DevelopParams` is per-file. When a file is loaded for the first time, a row is
 upserted with default knobs (identity / no-op pipeline). Knob edits in the
-TUI mutate `App.develop_params` immediately; the changes are persisted to
-`develop_params_json` after a 250 ms debounce on the last edit. Force-flush
-points (selection change, focus change, app exit) commit any pending edits
-before they could be lost.
+TUI mutate `App.develop_params` immediately; the changes are committed in-memory
+as soon as a tiered debounce expires (50 ms once the worker has the source
+cached, 250 ms on the cold first preview), and the matching `update_params`
+write is queued for the save worker — the UI thread never blocks on SQLite
+during a knob tick. Force-flush points (selection change, focus change, app
+exit) call the same async path; on exit the save worker is joined before
+`run` returns so pending writes always land.
 
 ## On-Disk Preview Cache
 
