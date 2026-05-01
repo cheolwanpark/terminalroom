@@ -38,16 +38,16 @@ The app opens in a single screen. The layout is fixed:
 |     TERMINALROOM   (ASCII banner — 6 rows, ANSI Shadow)            |
 +--------------------------------------------------------------------+
 |                  | Develop      | Image Info     | Navigation       |
-|                  | Exposure  +0 | Make:  SONY    |  IMG_0421 ✓      |
-|     preview      |▶Temp   5500K | Model: A7iii   |▶ IMG_0422 ✗      |
-|                  | Tint    0.0  | ISO    400     |  IMG_0423 ·      |
+|                  | Exposure  +0 | Make:  SONY    |  IMG_0421        |
+|     preview      |▶Temp   5500K | Model: A7iii   |▶ IMG_0422        |
+|                  | Tint    0.0  | ISO    400     |  IMG_0423 R      |
 |                  | Look Str 1.0 | 1/250 f/2.8    |  IMG_0424        |
 |                  | …            | 35mm           |                  |
 |                  |              | File: IMG_…ARW |                  |
 |                  |              | RAW · 24.3 MB  |                  |
 |                  |              | 6000 × 4000    |                  |
 +--------------------------------------------------------------------+
-| <filename>  i/N  STATE  [filter:e/t]  <focus-aware shortcuts>      |
+| <filename>  i/N  [REMOVED]  [filter:e/t]  <focus-aware shortcuts>  |
 +--------------------------------------------------------------------+
 ```
 
@@ -57,15 +57,15 @@ The banner falls back to a single-row stylized title when the terminal is narrow
 
 The currently focused side tab is drawn with a thick yellow border; the other tabs use the default border. Image Info is read-only and never gets focus.
 
-The filmstrip is text-only: each row shows the file name plus a state badge (`✓` pick, `✗` reject, `·` unset). The selected row is reverse-highlighted; long names are truncated with an ellipsis. The filmstrip auto-scrolls to keep the selection visible.
+The filmstrip is text-only: each row shows the file name. Removed entries are dimmed and carry a red `R` badge on the right; non-removed entries render plain. The selected row is reverse-highlighted; long names are truncated with an ellipsis. The filmstrip auto-scrolls to keep the selection visible.
 
-The status line shows the current filename, `i/N` (where `N` is the visible count after the active filter), the current state label, an optional `filter: enabled/total` indicator when a filter is active, and a focus-aware shortcut hint.
+The status line shows the current filename, `i/N` (where `N` is the visible count after the active filter and the show-removed toggle), a bold red `REMOVED` label when the current entry is removed and visible (only possible when `show-removed` is on), an optional `filter: enabled/total` indicator when a filter is active, and a focus-aware shortcut hint.
 
 ## Focus Model
 
 Two focus modes inside the main view:
 
-- **Navigation focus** (default): keys move between images and apply culling state.
+- **Navigation focus** (default): keys move between images, mark them removed/restored, and toggle show-removed view.
 - **Develop focus**: keys navigate and adjust the 12 develop knobs.
 
 `Enter` in Navigation focus shifts focus to the Develop tab. `Esc` in Develop focus returns to Navigation. The active focus is indicated by the tab border (thick yellow on the focused tab; default border elsewhere) and by the shortcut hint in the status line.
@@ -79,9 +79,9 @@ Navigation focus:
 ```text
 j / Down   next image
 k / Up     previous image
-p          mark pick
-x          mark reject
-u          unset culling decision
+x          mark current image as removed
+r          restore current image (no-op if not removed)
+R          toggle "show removed" (Shift+R)
 f          open format filter popup
 Enter      focus the Develop tab
 q          quit
@@ -166,7 +166,7 @@ Defaults are identity (every knob at zero / 5500 K / Look Strength 1.0 with `Ide
 
 When the Develop tab is **not** focused, the knob list is dimmed (no cursor symbol, dim labels and values) so the focus state is visible at a glance. When focused, labels are normal weight, values are bold, and a `▶ ` cursor marks the focused knob.
 
-Knob values are session-only in the MVP. Sidecar persistence is post-MVP.
+Knob values are persisted per file in the global SQLite (`~/.terminalroom/db.sqlite`). Edits commit after a 250 ms debounce on the last adjust; the same debounce gates re-rendering, so quickly held arrow keys settle into one re-render once you stop pressing. Force-flush points (file change, focus change, quit) ensure no edits are lost beyond the debounce window.
 
 ## Image Info Tab
 

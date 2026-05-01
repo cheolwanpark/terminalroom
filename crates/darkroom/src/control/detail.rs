@@ -7,8 +7,6 @@
 
 use crate::control::Control;
 use crate::primitive::blur::gaussian_blur_1ch;
-use crate::primitive::curve::MIDDLE_GRAY;
-use crate::primitive::mask::midtone_mask;
 use crate::primitive::noise::noise_at;
 use crate::space::{Buffer, LinearSrgb, Oklch};
 
@@ -44,25 +42,36 @@ impl Control for Clarity {
         if self.value == 0.0 {
             return;
         }
-        let amount = self.value * iso_attenuation(self.iso) * 0.5;
+        let amount = self.value * iso_attenuation(self.iso);
         let (w, h) = image.dimensions();
         let plane = image.plane_size();
         let l_clone = image.data()[..plane].to_vec();
         let blurred = gaussian_blur_1ch(&l_clone, w, h, 2.0);
-        let inv_mid = 1.0 / MIDDLE_GRAY;
         let l_mut = &mut image.data_mut()[..plane];
         for i in 0..plane {
             let lv = l_clone[i];
             let detail = lv - blurred[i];
-            let log_y = if lv > 0.0 {
-                (lv * inv_mid).log2()
-            } else {
-                -10.0
-            };
-            let mask = midtone_mask(log_y);
+            let mask = clarity_mask(lv);
             l_mut[i] = (lv + amount * detail * mask).max(0.0).min(1.5);
         }
     }
+}
+
+/// Bell-curve mask over the OKLab L domain. Peaks broadly in midtones
+/// (L ≈ 0.4–0.7) and rolls off into deep shadows (L < 0.15) and clipped
+/// highlights (L > 0.9), where unsharp masking is undesirable.
+fn clarity_mask(l: f32) -> f32 {
+    let lo = smoothstep(0.10, 0.35, l);
+    let hi = 1.0 - smoothstep(0.70, 0.95, l);
+    (lo * hi).clamp(0.0, 1.0)
+}
+
+fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    if edge1 == edge0 {
+        return if x < edge0 { 0.0 } else { 1.0 };
+    }
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }
 
 /// Additive deterministic luminance noise, applied just before sRGB encode.

@@ -7,15 +7,20 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+blake3.workspace = true
 clap.workspace = true
+crc32fast.workspace = true
 crossbeam-channel.workspace = true
 crossterm.workspace = true
 darkroom = { path = "../darkroom" }
+dirs.workspace = true
 image.workspace = true
 lru.workspace = true
 ratatui.workspace = true
 ratatui-image.workspace = true
 rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

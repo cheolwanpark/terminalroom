@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 use std::io;
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, select};
@@ -30,7 +30,7 @@ use darkroom::{
 };
 
 use crate::app::{App, FileMeta, Focus, View};
-use crate::db::CullingState;
+use crate::cache::Cache as DiskCache;
 
 mod banner;
 mod develop;
@@ -41,14 +41,11 @@ mod preview;
 mod status;
 
 const TICK: Duration = Duration::from_millis(100);
+const DEBOUNCE: Duration = Duration::from_millis(250);
 const PREVIEW_CACHE_CAP: usize = 9;
-/// Width of each side tab (Develop, Image Info, Navigation/filmstrip).
 const TAB_WIDTH: u16 = 28;
-/// Total side-tab columns + 2-cell preview borders.
 const SIDE_RESERVED_COLS: u16 = TAB_WIDTH * 3 + 2;
-/// Status row + 2-cell preview borders.
 const STATUS_RESERVED_ROWS: u16 = 1 + 2;
-/// Re-enqueue jobs only when target dimensions move at least this fraction.
 const TARGET_DEBOUNCE: f64 = 0.25;
 
 pub(crate) struct PreviewEntry {
@@ -66,6 +63,7 @@ struct Job {
     generation: u64,
     params: DevelopParams,
     params_fingerprint: u64,
+    source_fp: u64,
     size_bytes: u64,
 }
 
@@ -74,6 +72,7 @@ struct JobDone {
     generation: u64,
     target: TargetSize,
     params_fingerprint: u64,
+    source_fp: u64,
     result: std::result::Result<Srgb8, DevelopError>,
     meta: Option<FileMeta>,
 }
@@ -87,7 +86,7 @@ impl Drop for TerminalGuard {
     }
 }
 
-pub fn run(app: &mut App) -> Result<()> {
+pub fn run(app: &mut App, disk_cache: DiskCache) -> Result<()> {
     enable_raw_mode().context("failed to enable terminal raw mode")?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen).context("failed to enter terminal alternate screen")?;
@@ -102,7 +101,6 @@ pub fn run(app: &mut App) -> Result<()> {
             app.status = Some(format!(
                 "image protocol detection failed: {e}; rendering text only"
             ));
-            // Fall back to a 1x2 fontsize picker; ratatui-image will choose halfblocks.
             Picker::from_fontsize((1, 2))
         }
     };
@@ -114,16 +112,48 @@ pub fn run(app: &mut App) -> Result<()> {
     spawn_event_thread(event_tx);
     spawn_worker(job_rx, done_tx);
 
-    let mut cache: LruCache<PathBuf, PreviewEntry> =
+    let mut mem_cache: LruCache<PathBuf, PreviewEntry> =
         LruCache::new(NonZeroUsize::new(PREVIEW_CACHE_CAP).unwrap());
-    let mut last_selection: Option<PathBuf> = None;
+    let mut last_id: Option<i64> = None;
     let mut last_target: Option<TargetSize> = None;
-    let mut last_params_fp: Option<u64> = None;
+    let mut last_rendered_fp: Option<u64> = None;
+    let mut params_dirty_at: Option<Instant> = None;
+    let mut last_dirty_fp: Option<u64> = None;
     let mut current_generation: u64 = 0;
     let mut current_cancel: Option<Arc<AtomicBool>> = None;
     let mut latest_generation: HashMap<PathBuf, u64> = HashMap::new();
 
     loop {
+        // 1. Pending-edit detection. The timer is "250 ms after the LAST
+        //    adjust" — every fingerprint change resets it. Once the user stops
+        //    adjusting and 250 ms elapses, we flush.
+        let pending = pending_develop_change(app);
+        if pending {
+            let live_fp = app.develop_params.fingerprint();
+            if last_dirty_fp != Some(live_fp) {
+                params_dirty_at = Some(Instant::now());
+                last_dirty_fp = Some(live_fp);
+            }
+        } else {
+            params_dirty_at = None;
+            last_dirty_fp = None;
+        }
+
+        // 2. Debounced flush: persist pending edits + commit once the timer
+        //    has lain idle for DEBOUNCE.
+        if pending && params_dirty_at.is_some_and(|t| t.elapsed() >= DEBOUNCE) {
+            flush_pending_develop(app, now_unix());
+            params_dirty_at = None;
+            last_dirty_fp = None;
+        }
+
+        // 3. Compute the current selection state and decide whether to render.
+        let current_id = app.current().map(|e| e.id);
+        let current_path = app.current().map(|e| e.file.canonical_path.clone());
+        let current_source_fp = app.current().map(|e| e.source_fp);
+        let render_fp = app.current().map(|e| e.develop_params_fp);
+        let size_now = app.current().map(|e| e.file.size_bytes).unwrap_or(0);
+
         let size = terminal.size().unwrap_or(Size {
             width: 80,
             height: 24,
@@ -131,80 +161,162 @@ pub fn run(app: &mut App) -> Result<()> {
         let banner_h = banner::height_for(size.width);
         let target = preview_target(size, banner_h, picker.font_size());
 
-        let path_now = app.current().map(|e| e.file.canonical_path.clone());
-        let size_now = app.current().map(|e| e.file.size_bytes).unwrap_or(0);
-
         let target_changed = last_target
             .map(|prev| target_changed_meaningfully(prev, target))
             .unwrap_or(true);
-        let selection_changed = path_now != last_selection;
-        let params_fp = app.develop_params.fingerprint();
-        let params_changed = last_params_fp != Some(params_fp);
+        let selection_changed = current_id != last_id;
+        let render_fp_changed = render_fp != last_rendered_fp;
 
-        if selection_changed || (path_now.is_some() && target_changed) || params_changed {
-            // Cancel any in-flight job for the prior generation.
-            if let Some(c) = current_cancel.take() {
-                c.store(true, Ordering::Relaxed);
-            }
-            current_generation = current_generation.saturating_add(1);
-
-            if let Some(path) = path_now.as_ref() {
-                let needs_render = cache
-                    .peek(path)
-                    .map(|e| {
-                        target_changed_meaningfully(e.rendered_target, target)
-                            || e.params_fingerprint != params_fp
-                    })
-                    .unwrap_or(true);
-                if needs_render {
-                    let cancel = Arc::new(AtomicBool::new(false));
-                    current_cancel = Some(cancel.clone());
-                    latest_generation.insert(path.clone(), current_generation);
-                    let _ = job_tx.send(Job {
-                        path: path.clone(),
-                        target,
-                        cancel,
-                        generation: current_generation,
-                        params: app.develop_params.clone(),
-                        params_fingerprint: params_fp,
-                        size_bytes: size_now,
-                    });
+        if (selection_changed || target_changed || render_fp_changed) && current_id.is_some() {
+            if let (Some(path), Some(src_fp), Some(rfp)) =
+                (current_path.clone(), current_source_fp, render_fp)
+            {
+                // Cancel any in-flight job from the prior generation.
+                if let Some(c) = current_cancel.take() {
+                    c.store(true, Ordering::Relaxed);
                 }
-            }
+                current_generation = current_generation.saturating_add(1);
 
-            last_selection = path_now;
-            last_target = Some(target);
-            last_params_fp = Some(params_fp);
+                let in_memory_hit = mem_cache.peek(&path).is_some_and(|e| {
+                    !target_changed_meaningfully(e.rendered_target, target)
+                        && e.params_fingerprint == rfp
+                });
+
+                if !in_memory_hit {
+                    if let Some(srgb8) =
+                        disk_cache.get(&path, src_fp, rfp, &mut app.db, now_unix())
+                    {
+                        install_in_memory(&mut mem_cache, &picker, &path, target, rfp, srgb8, app);
+                    } else {
+                        let cancel = Arc::new(AtomicBool::new(false));
+                        current_cancel = Some(cancel.clone());
+                        latest_generation.insert(path.clone(), current_generation);
+                        let _ = job_tx.send(Job {
+                            path: path.clone(),
+                            target,
+                            cancel,
+                            generation: current_generation,
+                            params: app.develop_params.clone(),
+                            params_fingerprint: rfp,
+                            source_fp: src_fp,
+                            size_bytes: size_now,
+                        });
+                    }
+                }
+
+                last_target = Some(target);
+                last_id = current_id;
+                last_rendered_fp = render_fp;
+            }
+        } else if selection_changed {
+            // No current selection (empty list) — clear tracking.
+            last_id = current_id;
+            last_rendered_fp = None;
         }
 
+        // 4. Draw.
         let font_size = picker.font_size();
         terminal
-            .draw(|frame| draw(frame, app, &mut cache, font_size))
+            .draw(|frame| draw(frame, app, &mut mem_cache, font_size))
             .context("failed to draw frame")?;
+
+        // 5. Wait for events, bounding the timeout by the remaining debounce.
+        let timeout = match params_dirty_at {
+            Some(t) => DEBOUNCE.saturating_sub(t.elapsed()).min(TICK).max(Duration::from_millis(5)),
+            None => TICK,
+        };
 
         select! {
             recv(event_rx) -> ev => {
                 let Ok(ev) = ev else { break; };
                 match ev {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
-                        if handle_key(app, key) == Action::Quit { break; }
+                        if handle_key(app, key) == Action::Quit {
+                            // Force-flush any pending knob edits before exiting.
+                            if pending_develop_change(app) {
+                                flush_pending_develop(app, now_unix());
+                            }
+                            break;
+                        }
                     }
-                    Event::Resize(_, _) => {
-                        // Next loop iteration recomputes target and may re-enqueue jobs.
-                    }
+                    Event::Resize(_, _) => {}
                     _ => {}
                 }
             }
             recv(done_rx) -> done => {
                 let Ok(done) = done else { break; };
-                handle_job_done(done, &mut cache, &picker, app, &latest_generation);
+                handle_job_done(
+                    done,
+                    &mut mem_cache,
+                    &disk_cache,
+                    &picker,
+                    app,
+                    &latest_generation,
+                );
             }
-            default(TICK) => {}
+            default(timeout) => {}
         }
     }
 
     drop(job_tx);
     Ok(())
+}
+
+fn pending_develop_change(app: &App) -> bool {
+    let Some(entry) = app.current() else {
+        return false;
+    };
+    let current_fp = app.develop_params.fingerprint();
+    current_fp != entry.develop_params_fp
+}
+
+fn flush_pending_develop(app: &mut App, now: i64) {
+    let Some(entry) = app.current() else { return };
+    let id = entry.id;
+    let current_fp = app.develop_params.fingerprint();
+    if current_fp == entry.develop_params_fp {
+        return;
+    }
+    let params = app.develop_params.clone();
+    match app.db.update_params(id, &params, current_fp, now) {
+        Ok(()) => {
+            app.commit_develop_params(current_fp);
+        }
+        Err(e) => {
+            app.status = Some(format!("failed to save knobs: {e}"));
+        }
+    }
+}
+
+fn install_in_memory(
+    mem_cache: &mut LruCache<PathBuf, PreviewEntry>,
+    picker: &Picker,
+    path: &Path,
+    target: TargetSize,
+    params_fp: u64,
+    srgb8: Srgb8,
+    app: &mut App,
+) {
+    let (w, h) = (srgb8.width, srgb8.height);
+    if let Some(buf) = ImageBuffer::<Rgb<u8>, _>::from_raw(w, h, srgb8.pixels) {
+        let entry = PreviewEntry {
+            proto: picker.new_resize_protocol(DynamicImage::ImageRgb8(buf)),
+            src_w: w,
+            src_h: h,
+            rendered_target: target,
+            params_fingerprint: params_fp,
+        };
+        mem_cache.put(path.to_path_buf(), entry);
+        if app
+            .status
+            .as_deref()
+            .is_some_and(|s| s.starts_with("preview error"))
+        {
+            app.status = None;
+        }
+    } else {
+        app.status = Some("preview error: rgb buffer shape mismatch".into());
+    }
 }
 
 fn spawn_event_thread(tx: Sender<Event>) {
@@ -227,6 +339,7 @@ fn spawn_worker(rx: Receiver<Job>, tx: Sender<JobDone>) {
                 generation,
                 params,
                 params_fingerprint,
+                source_fp,
                 size_bytes,
             } = job;
             let (result, meta) = if cancel.load(Ordering::Relaxed) {
@@ -247,6 +360,7 @@ fn spawn_worker(rx: Receiver<Job>, tx: Sender<JobDone>) {
                     generation,
                     target,
                     params_fingerprint,
+                    source_fp,
                     result,
                     meta,
                 })
@@ -281,7 +395,8 @@ fn file_meta_from(loaded: &Loaded, size_bytes: u64) -> FileMeta {
 
 fn handle_job_done(
     done: JobDone,
-    cache: &mut LruCache<PathBuf, PreviewEntry>,
+    mem_cache: &mut LruCache<PathBuf, PreviewEntry>,
+    disk_cache: &DiskCache,
     picker: &Picker,
     app: &mut App,
     latest_generation: &HashMap<PathBuf, u64>,
@@ -296,31 +411,28 @@ fn handle_job_done(
 
     match done.result {
         Ok(rgb) => {
-            let (w, h) = (rgb.width, rgb.height);
-            match ImageBuffer::<Rgb<u8>, _>::from_raw(w, h, rgb.pixels) {
-                Some(buf) => {
-                    let entry = PreviewEntry {
-                        proto: picker.new_resize_protocol(DynamicImage::ImageRgb8(buf)),
-                        src_w: w,
-                        src_h: h,
-                        rendered_target: done.target,
-                        params_fingerprint: done.params_fingerprint,
-                    };
-                    cache.put(done.path.clone(), entry);
-                    if app
-                        .status
-                        .as_deref()
-                        .is_some_and(|s| s.starts_with("preview error"))
-                    {
-                        app.status = None;
-                    }
-                }
-                None => {
-                    app.status = Some("preview error: rgb buffer shape mismatch".into());
-                }
+            // Persist to on-disk cache before consuming the buffer.
+            if let Err(e) = disk_cache.insert(
+                &done.path,
+                done.source_fp,
+                done.params_fingerprint,
+                &rgb,
+                &mut app.db,
+                now_unix(),
+            ) {
+                app.status = Some(format!("cache write failed: {e}"));
             }
+            install_in_memory(
+                mem_cache,
+                picker,
+                &done.path,
+                done.target,
+                done.params_fingerprint,
+                rgb,
+                app,
+            );
         }
-        Err(DevelopError::Cancelled) => {} // benign
+        Err(DevelopError::Cancelled) => {}
         Err(e) => {
             app.status = Some(format!("preview error: {e}"));
         }
@@ -330,7 +442,7 @@ fn handle_job_done(
 fn draw(
     frame: &mut ratatui::Frame,
     app: &mut App,
-    cache: &mut LruCache<PathBuf, PreviewEntry>,
+    mem_cache: &mut LruCache<PathBuf, PreviewEntry>,
     font_size: (u16, u16),
 ) {
     let area = frame.area();
@@ -352,7 +464,7 @@ fn draw(
     ])
     .areas(main_area);
 
-    preview::render(frame, app, cache, preview_area, font_size);
+    preview::render(frame, app, mem_cache, preview_area, font_size);
     develop::render(frame, app, develop_area);
     info::render(frame, app, info_area);
     filmstrip::render(frame, app, filmstrip_area);
@@ -400,22 +512,47 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Action {
     match app.view {
         View::Filter => handle_filter_key(app, key.code),
         View::Main => match app.focus {
-            Focus::Navigation => handle_navigation_key(app, key.code),
+            Focus::Navigation => handle_navigation_key(app, key),
             Focus::Develop => handle_develop_key(app, key.code),
         },
     }
 }
 
-fn handle_navigation_key(app: &mut App, code: KeyCode) -> Action {
-    match code {
+fn handle_navigation_key(app: &mut App, key: KeyEvent) -> Action {
+    let now = now_unix();
+    match key.code {
         KeyCode::Char('q') => return Action::Quit,
-        KeyCode::Char('j') | KeyCode::Down => app.next(),
-        KeyCode::Char('k') | KeyCode::Up => app.prev(),
-        KeyCode::Char('p') => app.set_state(CullingState::Pick, now_unix()),
-        KeyCode::Char('x') => app.set_state(CullingState::Reject, now_unix()),
-        KeyCode::Char('u') => app.set_state(CullingState::Unset, now_unix()),
-        KeyCode::Char('f') => app.open_filter(),
-        KeyCode::Enter => app.enter_develop(),
+        KeyCode::Char('j') | KeyCode::Down => {
+            flush_pending_develop(app, now);
+            app.next();
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            flush_pending_develop(app, now);
+            app.prev();
+        }
+        KeyCode::Char('x') => {
+            flush_pending_develop(app, now);
+            app.remove_current(now);
+        }
+        // Lowercase 'r' restores the current entry (no-op if not removed).
+        // Uppercase 'R' toggles "show removed" view. crossterm sends 'R' as
+        // Char('R') with KeyModifiers::SHIFT.
+        KeyCode::Char('r') => {
+            flush_pending_develop(app, now);
+            app.restore_current(now);
+        }
+        KeyCode::Char('R') => {
+            flush_pending_develop(app, now);
+            app.toggle_show_removed();
+        }
+        KeyCode::Char('f') => {
+            flush_pending_develop(app, now);
+            app.open_filter();
+        }
+        KeyCode::Enter => {
+            flush_pending_develop(app, now);
+            app.enter_develop();
+        }
         _ => {}
     }
     Action::Continue
@@ -424,7 +561,10 @@ fn handle_navigation_key(app: &mut App, code: KeyCode) -> Action {
 fn handle_develop_key(app: &mut App, code: KeyCode) -> Action {
     match code {
         KeyCode::Char('q') => return Action::Quit,
-        KeyCode::Esc => app.exit_develop(),
+        KeyCode::Esc => {
+            flush_pending_develop(app, now_unix());
+            app.exit_develop();
+        }
         KeyCode::Char('j') | KeyCode::Down => app.develop_next(),
         KeyCode::Char('k') | KeyCode::Up => app.develop_prev(),
         KeyCode::Char('h') | KeyCode::Left => app.develop_adjust(-1.0),
@@ -458,7 +598,6 @@ pub(crate) fn resize_strategy() -> Resize {
     Resize::Scale(None)
 }
 
-/// Block with the focus-aware border styling shared by the three side tabs.
 pub(crate) fn tab_block(title: &'static str, focused: bool) -> Block<'static> {
     let mut block = Block::default().borders(Borders::ALL).title(title);
     if focused {
@@ -468,3 +607,4 @@ pub(crate) fn tab_block(title: &'static str, focused: bool) -> Block<'static> {
     }
     block
 }
+

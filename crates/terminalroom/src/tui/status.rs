@@ -1,46 +1,60 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::app::{App, Focus};
-use crate::db::CullingState;
 
 pub fn render(frame: &mut Frame, app: &App, area: Rect) {
-    let text = if let Some(entry) = app.current() {
-        let state_label = match entry.state {
-            CullingState::Pick => "PICK",
-            CullingState::Reject => "REJECT",
-            CullingState::Unset => "UNSET",
-        };
+    let line = if let Some(entry) = app.current() {
         let total = app.visible.len();
-        let filter_indicator = filter_indicator(app);
-        let prefix = format!(
-            "{}   {}/{}   {}{}",
-            entry.file.display_name,
-            app.cursor + 1,
-            total,
-            state_label,
-            filter_indicator
-        );
-        if let Some(msg) = &app.status {
-            format!("{prefix}   {msg}")
-        } else {
-            format!("{prefix}   {}", shortcuts(app.focus))
+        let mut spans = vec![
+            Span::raw(entry.file.display_name.clone()),
+            Span::raw("   "),
+            Span::raw(format!("{}/{}", app.cursor + 1, total)),
+        ];
+        if entry.removed {
+            spans.push(Span::raw("   "));
+            spans.push(Span::styled(
+                "REMOVED",
+                Style::default()
+                    .fg(Color::Red)
+                    .add_modifier(Modifier::BOLD),
+            ));
         }
-    } else {
         let filter_indicator = filter_indicator(app);
-        format!(
-            "(no files visible){filter_indicator}   {}",
-            shortcuts(app.focus)
-        )
+        if !filter_indicator.is_empty() {
+            spans.push(Span::raw(filter_indicator));
+        }
+        spans.push(Span::raw("   "));
+        if let Some(msg) = &app.status {
+            spans.push(Span::raw(msg.clone()));
+        } else {
+            spans.push(Span::raw(shortcuts(app.focus, app.show_removed).to_string()));
+        }
+        Line::from(spans)
+    } else {
+        let mut spans = vec![Span::raw("(no files visible)")];
+        let filter_indicator = filter_indicator(app);
+        if !filter_indicator.is_empty() {
+            spans.push(Span::raw(filter_indicator));
+        }
+        spans.push(Span::raw("   "));
+        spans.push(Span::raw(shortcuts(app.focus, app.show_removed).to_string()));
+        Line::from(spans)
     };
-    frame.render_widget(Paragraph::new(text), area);
+    frame.render_widget(Paragraph::new(line), area);
 }
 
-fn shortcuts(focus: Focus) -> &'static str {
+fn shortcuts(focus: Focus, show_removed: bool) -> &'static str {
     match focus {
         Focus::Navigation => {
-            "j/k navigate · p/x/u cull · f filter · enter develop · q quit"
+            if show_removed {
+                "j/k navigate · x remove · r restore · R show-removed:on · f filter · enter develop · q quit"
+            } else {
+                "j/k navigate · x remove · r restore · R show-removed:off · f filter · enter develop · q quit"
+            }
         }
         Focus::Develop => "j/k knob · h/l adjust · r reset · esc back · q quit",
     }

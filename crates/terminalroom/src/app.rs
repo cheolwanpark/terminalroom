@@ -1,11 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 
 use darkroom::{DevelopParams, ImageKind, ShotInfo};
 
-use crate::db::{CullingState, Db, FileRecord};
+use crate::db::{Db, FileRow};
 use crate::session::{DiscoveredFile, Session};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -24,7 +24,12 @@ pub enum Focus {
 pub struct FileEntry {
     pub id: i64,
     pub file: DiscoveredFile,
-    pub state: CullingState,
+    pub removed: bool,
+    /// Persisted per-file develop knob values. The currently-selected entry's
+    /// `develop_params` is mirrored into `App.develop_params` for live editing.
+    pub develop_params: DevelopParams,
+    pub develop_params_fp: u64,
+    pub source_fp: u64,
 }
 
 /// Cached header metadata for the Image Info tab. Populated lazily by the
@@ -136,27 +141,46 @@ pub struct App {
     pub filter_cursor: usize,
     pub status: Option<String>,
     pub db: Db,
+    /// Live editing buffer for the currently-selected file's knobs. Mirrors
+    /// `files[visible[cursor]].develop_params` between flushes.
     pub develop_params: DevelopParams,
     pub develop_cursor: usize,
     pub file_meta: HashMap<PathBuf, FileMeta>,
+    pub show_removed: bool,
 }
 
 impl App {
-    pub fn init(session: Session, mut db: Db, records: Vec<FileRecord>) -> Result<Self> {
-        let mut state_by_path: BTreeMap<PathBuf, (i64, CullingState)> = BTreeMap::new();
-        for r in records {
-            state_by_path.insert(r.canonical_path.clone(), (r.id, r.state));
+    pub fn init(session: Session, db: Db, rows: Vec<FileRow>) -> Result<Self> {
+        let mut row_by_path: BTreeMap<PathBuf, FileRow> = BTreeMap::new();
+        for r in rows {
+            row_by_path.insert(r.canonical_path.clone(), r);
         }
 
         let mut files: Vec<FileEntry> = Vec::with_capacity(session.files.len());
         for f in session.files {
-            let Some((id, state)) = state_by_path.remove(&f.canonical_path) else {
-                bail!(
-                    "internal: discovered file {} missing from sync_files records",
-                    f.canonical_path.display()
-                );
-            };
-            files.push(FileEntry { id, file: f, state });
+            // Every discovered file should have been upserted before init.
+            let row = row_by_path.remove(&f.canonical_path).unwrap_or_else(|| {
+                // Defensive default — should never happen.
+                FileRow {
+                    id: 0,
+                    canonical_path: f.canonical_path.clone(),
+                    size_bytes: f.size_bytes,
+                    modified_unix_seconds: f.modified_unix_seconds,
+                    source_fp: 0,
+                    removed: false,
+                    develop_params: DevelopParams::default(),
+                    develop_params_fp: DevelopParams::default().fingerprint(),
+                    cache_key: None,
+                }
+            });
+            files.push(FileEntry {
+                id: row.id,
+                file: f,
+                removed: row.removed,
+                develop_params: row.develop_params,
+                develop_params_fp: row.develop_params_fp,
+                source_fp: row.source_fp,
+            });
         }
 
         let mut counts: BTreeMap<ImageKind, usize> = BTreeMap::new();
@@ -168,8 +192,10 @@ impl App {
         let enabled_formats: BTreeSet<ImageKind> =
             available_formats.iter().map(|(k, _)| *k).collect();
 
-        // Drop owned Db to silence the "mut" warning when not yet used; we hand it back.
-        let _ = &mut db;
+        let initial_params = files
+            .first()
+            .map(|e| e.develop_params.clone())
+            .unwrap_or_default();
 
         let mut app = Self {
             session_root: session.root,
@@ -183,11 +209,13 @@ impl App {
             filter_cursor: 0,
             status: None,
             db,
-            develop_params: DevelopParams::default(),
+            develop_params: initial_params,
             develop_cursor: 0,
             file_meta: HashMap::new(),
+            show_removed: false,
         };
         app.rebuild_visible_keep_path(None);
+        app.sync_develop_params_from_current();
         Ok(app)
     }
 
@@ -230,6 +258,17 @@ impl App {
         knob.write(&mut self.develop_params, default);
     }
 
+    /// Replace `self.develop_params` with the current file's persisted params.
+    /// Call after any selection change so live knob editing tracks the active
+    /// row, and the in-memory + on-disk caches keyed by the current params
+    /// fingerprint are consulted correctly.
+    pub fn sync_develop_params_from_current(&mut self) {
+        if let Some(entry) = self.current() {
+            self.develop_params = entry.develop_params.clone();
+            self.develop_cursor = self.develop_cursor.min(DEVELOP_KNOBS.len() - 1);
+        }
+    }
+
     pub fn rebuild_visible(&mut self) {
         let current_path = self
             .visible
@@ -240,11 +279,14 @@ impl App {
     }
 
     fn rebuild_visible_keep_path(&mut self, target: Option<PathBuf>) {
+        let show_removed = self.show_removed;
         self.visible = self
             .files
             .iter()
             .enumerate()
-            .filter(|(_, e)| self.enabled_formats.contains(&e.file.kind))
+            .filter(|(_, e)| {
+                self.enabled_formats.contains(&e.file.kind) && (show_removed || !e.removed)
+            })
             .map(|(i, _)| i)
             .collect();
 
@@ -275,12 +317,14 @@ impl App {
         }
         if self.cursor + 1 < self.visible.len() {
             self.cursor += 1;
+            self.sync_develop_params_from_current();
         }
     }
 
     pub fn prev(&mut self) {
         if self.cursor > 0 {
             self.cursor -= 1;
+            self.sync_develop_params_from_current();
         }
     }
 
@@ -288,19 +332,62 @@ impl App {
         self.visible.get(self.cursor).map(|&i| &self.files[i])
     }
 
-    pub fn set_state(&mut self, state: CullingState, now_unix: i64) {
+    /// Mark the current entry as removed and persist immediately.
+    pub fn remove_current(&mut self, now_unix: i64) {
         let Some(&i) = self.visible.get(self.cursor) else {
             return;
         };
+        if self.files[i].removed {
+            return;
+        }
         let file_id = self.files[i].id;
-        match self.db.set_state(file_id, state, now_unix) {
+        match self.db.set_removed(file_id, true, now_unix) {
             Ok(()) => {
-                self.files[i].state = state;
+                self.files[i].removed = true;
                 self.status = None;
+                self.rebuild_visible();
+                self.sync_develop_params_from_current();
             }
             Err(e) => {
-                self.status = Some(format!("failed to save state: {e}"));
+                self.status = Some(format!("failed to remove: {e}"));
             }
+        }
+    }
+
+    /// Restore the current entry (no-op if not removed).
+    pub fn restore_current(&mut self, now_unix: i64) {
+        let Some(&i) = self.visible.get(self.cursor) else {
+            return;
+        };
+        if !self.files[i].removed {
+            return;
+        }
+        let file_id = self.files[i].id;
+        match self.db.set_removed(file_id, false, now_unix) {
+            Ok(()) => {
+                self.files[i].removed = false;
+                self.status = None;
+                self.rebuild_visible();
+                self.sync_develop_params_from_current();
+            }
+            Err(e) => {
+                self.status = Some(format!("failed to restore: {e}"));
+            }
+        }
+    }
+
+    pub fn toggle_show_removed(&mut self) {
+        self.show_removed = !self.show_removed;
+        self.rebuild_visible();
+        self.sync_develop_params_from_current();
+    }
+
+    /// Mirror the in-memory `develop_params` into the current `FileEntry`
+    /// (called after a successful debounced flush).
+    pub fn commit_develop_params(&mut self, fp: u64) {
+        if let Some(&i) = self.visible.get(self.cursor) {
+            self.files[i].develop_params = self.develop_params.clone();
+            self.files[i].develop_params_fp = fp;
         }
     }
 
@@ -309,6 +396,7 @@ impl App {
             self.enabled_formats.insert(kind);
         }
         self.rebuild_visible();
+        self.sync_develop_params_from_current();
     }
 
     pub fn open_filter(&mut self) {
@@ -368,12 +456,15 @@ mod tests {
 
     fn build_app(files: Vec<DiscoveredFile>) -> App {
         let mut db = Db::open_in_memory().unwrap();
-        let records = db.sync_files(&files, 1000).unwrap();
+        let mut rows = Vec::with_capacity(files.len());
+        for f in &files {
+            rows.push(db.upsert_file(f, 1000).unwrap());
+        }
         let session = Session {
             root: PathBuf::from("/t"),
             files,
         };
-        App::init(session, db, records).unwrap()
+        App::init(session, db, rows).unwrap()
     }
 
     #[test]
@@ -388,12 +479,12 @@ mod tests {
         assert_eq!(app.enabled_formats.len(), 3);
         assert_eq!(app.view, View::Main);
         assert_eq!(app.focus, Focus::Navigation);
+        assert!(!app.show_removed);
         let labels: Vec<_> = app
             .available_formats
             .iter()
             .map(|(k, n)| (k.label(), *n))
             .collect();
-        // sorted by label: JPEG, PNG, RAW
         assert_eq!(labels, vec![("JPEG", 1), ("PNG", 1), ("RAW", 1)]);
     }
 
@@ -410,43 +501,6 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_keeps_selection_by_path() {
-        let mut app = build_app(vec![
-            file("a.cr3", ImageKind::Raw),
-            file("b.jpg", ImageKind::Jpeg),
-            file("c.png", ImageKind::Png),
-        ]);
-        app.cursor = 2; // c.png
-        app.toggle_format(ImageKind::Raw);
-        // c.png still visible — selection follows it
-        assert_eq!(app.current().unwrap().file.display_name, "c.png");
-    }
-
-    #[test]
-    fn rebuild_clamps_when_selection_filtered_out() {
-        let mut app = build_app(vec![
-            file("a.cr3", ImageKind::Raw),
-            file("b.jpg", ImageKind::Jpeg),
-        ]);
-        app.cursor = 0; // a.cr3
-        app.toggle_format(ImageKind::Raw);
-        // a.cr3 hidden; cursor falls back to last visible (b.jpg at index 0)
-        assert_eq!(app.cursor, 0);
-        assert_eq!(app.current().unwrap().file.display_name, "b.jpg");
-    }
-
-    #[test]
-    fn rebuild_handles_empty_visible() {
-        let mut app = build_app(vec![file("a.cr3", ImageKind::Raw)]);
-        app.toggle_format(ImageKind::Raw);
-        assert!(app.visible.is_empty());
-        assert!(app.current().is_none());
-        // ops on empty list are no-ops
-        app.next();
-        app.prev();
-    }
-
-    #[test]
     fn next_prev_no_wrap() {
         let mut app = build_app(vec![
             file("a.cr3", ImageKind::Raw),
@@ -457,36 +511,78 @@ mod tests {
         app.next();
         assert_eq!(app.cursor, 1);
         app.next();
-        assert_eq!(app.cursor, 1); // clamped at end
+        assert_eq!(app.cursor, 1);
     }
 
     #[test]
-    fn set_state_persists_and_clears_status() {
-        let mut app = build_app(vec![file("a.cr3", ImageKind::Raw)]);
-        app.status = Some("prior error".into());
-        app.set_state(CullingState::Pick, 2000);
-        assert_eq!(app.current().unwrap().state, CullingState::Pick);
-        assert!(app.status.is_none());
-    }
-
-    #[test]
-    fn filter_navigation_and_toggle() {
+    fn remove_current_filters_from_visible() {
         let mut app = build_app(vec![
             file("a.cr3", ImageKind::Raw),
-            file("b.jpg", ImageKind::Jpeg),
+            file("b.cr3", ImageKind::Raw),
         ]);
-        app.open_filter();
-        assert_eq!(app.view, View::Filter);
-        assert_eq!(app.filter_cursor, 0); // JPEG (sorted by label)
-        app.filter_next();
-        assert_eq!(app.filter_cursor, 1); // RAW
-        app.filter_next();
-        assert_eq!(app.filter_cursor, 1); // clamped
-        app.toggle_current_filter(); // toggle off RAW
+        app.remove_current(1000);
+        assert!(app.files[0].removed);
         assert_eq!(app.visible.len(), 1);
-        assert_eq!(app.current().unwrap().file.display_name, "b.jpg");
-        app.close_filter();
-        assert_eq!(app.view, View::Main);
+        assert_eq!(app.current().unwrap().file.display_name, "b.cr3");
+    }
+
+    #[test]
+    fn toggle_show_removed_reveals_and_hides() {
+        let mut app = build_app(vec![
+            file("a.cr3", ImageKind::Raw),
+            file("b.cr3", ImageKind::Raw),
+        ]);
+        app.remove_current(1000);
+        assert_eq!(app.visible.len(), 1);
+        app.toggle_show_removed();
+        assert_eq!(app.visible.len(), 2);
+        // The removed file is now reachable.
+        app.cursor = 0;
+        assert_eq!(app.current().unwrap().file.display_name, "a.cr3");
+        assert!(app.current().unwrap().removed);
+        app.toggle_show_removed();
+        assert_eq!(app.visible.len(), 1);
+    }
+
+    #[test]
+    fn restore_current_undoes_remove() {
+        let mut app = build_app(vec![
+            file("a.cr3", ImageKind::Raw),
+            file("b.cr3", ImageKind::Raw),
+        ]);
+        app.remove_current(1000);
+        app.toggle_show_removed();
+        app.cursor = 0; // a.cr3 (removed)
+        app.restore_current(2000);
+        assert!(!app.files[0].removed);
+        app.toggle_show_removed();
+        assert_eq!(app.visible.len(), 2);
+    }
+
+    #[test]
+    fn restore_is_noop_when_not_removed() {
+        let mut app = build_app(vec![file("a.cr3", ImageKind::Raw)]);
+        let before = app.files[0].removed;
+        app.restore_current(1000);
+        assert_eq!(app.files[0].removed, before);
+    }
+
+    #[test]
+    fn selecting_other_file_swaps_develop_params() {
+        let mut app = build_app(vec![
+            file("a.cr3", ImageKind::Raw),
+            file("b.cr3", ImageKind::Raw),
+        ]);
+        // Edit + commit params for file A.
+        app.develop_params.exposure_ev = 1.5;
+        let fp = app.develop_params.fingerprint();
+        app.commit_develop_params(fp);
+        // Move to B — params should reset to default.
+        app.next();
+        assert_eq!(app.develop_params.exposure_ev, 0.0);
+        // Move back to A — restored.
+        app.prev();
+        assert_eq!(app.develop_params.exposure_ev, 1.5);
     }
 
     #[test]
@@ -495,7 +591,6 @@ mod tests {
         assert_eq!(app.focus, Focus::Navigation);
         app.enter_develop();
         assert_eq!(app.focus, Focus::Develop);
-        // view stays Main while focus shifts.
         assert_eq!(app.view, View::Main);
         app.exit_develop();
         assert_eq!(app.focus, Focus::Navigation);

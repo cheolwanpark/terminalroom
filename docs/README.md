@@ -5,9 +5,9 @@ Terminalroom is a terminal UI for culling and developing photographs. The first 
 - Run `terminalroom <path>`.
 - Load image files (RAW + JPEG/PNG/TIFF) from the target file or directory.
 - Show a single-screen layout: ASCII banner on top, preview on the left, three side tabs on the right (Develop / Image Info / Navigation), focus-aware status line at the bottom.
-- Cull (`p`/`x`/`u`), navigate (`j`/`k`), and adjust 12 develop knobs from the same screen — `Enter` shifts focus to the Develop tab, `Esc` returns.
+- Navigate (`j`/`k`), remove (`x`) and restore (`r`), toggle "show removed" (`R`), and adjust 12 develop knobs from the same screen — `Enter` shifts focus to the Develop tab, `Esc` returns.
 - Filter the visible files by format through a modal popup (key `f`).
-- Persist culling decisions in `<path>/.terminalroom.db`.
+- Persist per-file develop knobs and the removed flag to a single global `~/.terminalroom/db.sqlite`. Cache developed previews on disk under `~/.terminalroom/cache/` (LRU-bounded to 500 entries) so reopening a previously-viewed file shows its developed image instantly.
 - Develop knobs: Exposure, Temperature, Tint, Look Strength, Warmth, Color, Contrast, Soft Highlights, Shadows, Blacks, Clarity, Grain.
 
 ## Documents
@@ -19,7 +19,7 @@ Terminalroom is a terminal UI for culling and developing photographs. The first 
 
 ## Current Decisions
 
-- Use a Cargo workspace with four crates: `libraw-rs` (FFI), `codec` (file → memory struct with shot/sensor metadata), `darkroom` (develop pipeline), and `terminalroom` (library + binary). The library half of `terminalroom` holds headless modules (`session`, `db`, `app`) so they can be unit-tested without a TTY; `tui/` contains the ratatui rendering, split per panel (`banner`, `preview`, `develop`, `info`, `filmstrip`, `status`, `filter`), plus the worker thread and the event loop in `tui::mod`.
+- Use a Cargo workspace with four crates: `libraw-rs` (FFI), `codec` (file → memory struct with shot/sensor metadata), `darkroom` (develop pipeline), and `terminalroom` (library + binary). The library half of `terminalroom` holds headless modules (`session`, `db`, `cache`, `paths`, `app`) so they can be unit-tested without a TTY; `tui/` contains the ratatui rendering, split per panel (`banner`, `preview`, `develop`, `info`, `filmstrip`, `status`, `filter`), plus the worker thread and the event loop in `tui::mod`.
 - Dependency chain: `libraw-rs` → `codec` → `darkroom` → `terminalroom`. Strict linear pipeline; each crate has a single responsibility.
 - Keep all LibRaw FFI and unsafe code inside `libraw-rs`. The crate exposes capabilities (`read_header`, `read_demosaiced`) plus the metadata types (`ShotInfo`, `SensorInfo`, `OutputColorSpace`, `CfaPattern`, etc.) — orchestration policy lives in `codec`. `OutputColorSpace::Raw` (libraw code 0) is the develop-pipeline workhorse; `Rec2020` and others remain available for callers who want the matrix baked in.
 - Two memory structs in `codec`, one per source kind:
@@ -30,15 +30,17 @@ Terminalroom is a terminal UI for culling and developing photographs. The first 
 - Shot info (make/model/ISO/shutter/aperture/focal length) is parsed for both kinds. RAW reads it from libraw's `imgother`; image-format files read it from EXIF via `kamadak-exif`. Sensor info (black/white levels, CFA pattern, camera/daylight WB, color matrix, active area, crop area, orientation) is RAW-only.
 - `darkroom` is structured around three traits — `Transform`/`InPlaceTransform` (stateless A→B), `Control` (knob in a fixed `ColorSpace`), `Blend` (two-buffer, used by Look Strength) — over a planar f32 `Buffer<S>` phantom-typed by its color space (`CameraLinear`, `LinearRec2020`, `LinearSrgb`, `Oklab`, `Oklch`). Output is `Srgb8`. The closed `Op` enum carries runtime ordering; the pipeline executor in `pipeline.rs` walks the chain and inserts transforms between knob spaces.
 - Pipeline order (RAW): `read_camera_linear` → resize → Temperature/Tint (CameraLinear) → CameraToWorking → Exposure (LinearRec2020) → Look + LookStrength (in-linear blend) → tone batch in LinearRec2020 (extract Y, curve in log domain, scale RGB by Y'/Y to preserve hue) → Rec2020ToSrgb → LinearToOklab → Warmth (Oklab) → OklabToOklch → SoftHighlightsChroma + Color + Clarity (Oklch L) → OklchToOklab → OklabToLinear → Grain (LinearSrgb) → SrgbEncode. Two round-trips total: linear↔OKLab once for color, OKLab→linear for the final encode.
-- TUI preview loading runs on a dedicated worker thread fed by a `crossbeam-channel`. Each job decodes the header and runs `pipeline::develop_preview` (libraw `half_size=true` for RAW) for the requested target size and current `DevelopParams`; the cache is `LruCache<PathBuf, PreviewEntry>` keyed by canonical path with a `params_fingerprint` per entry. Selection change, ≥ 25% target dimension change, or knob adjustment re-enqueues the job; stale generations are dropped on receive.
+- TUI preview loading runs on a dedicated worker thread fed by a `crossbeam-channel`. Each job decodes the header and runs `pipeline::develop_preview` (libraw `half_size=true` for RAW) for the requested target size and current `DevelopParams`. There are two cache tiers: an in-memory `LruCache<PathBuf, PreviewEntry>` (cap 9, hot tier) keyed by canonical path with a `params_fingerprint` per entry, and a persistent on-disk cache at `~/.terminalroom/cache/` (LRU-bounded to 500 entries) keyed by BLAKE3-of-canonical-path. Selection change or ≥ 25% target dimension change tries the disk cache before enqueueing a worker job. Knob adjustments are debounced 250 ms before they trigger a re-render and a DB commit. Stale generations are dropped on receive; completed jobs write their result through to both tiers.
 - SIMD strategy: `wide::f32x8` for the always-on stable baseline (NEON on aarch64, SSE2 baseline on x86_64) over the planar layout — gain ops, 3×3 matrix multiply, OKLab linear stages, luminance, sRGB quantize. `pulp` is in the dep graph for runtime AVX2 dispatch on heavier kernels (planned: cbrt, blur). Resize stays on `fast_image_resize` (`PixelType::F32` per plane).
 - TUI preview rendering uses ratatui-image's `Resize::Scale` and a centered, aspect-fit sub-rect (computed against `picker.font_size()`) so landscape full-fills the width and portrait full-fills the height.
-- Use SQLite through `rusqlite` (bundled feature) for `.terminalroom.db`.
+- Use SQLite through `rusqlite` (bundled feature) for the global `~/.terminalroom/db.sqlite`. One row per file (keyed by canonical path) carries the `removed` flag, persisted `DevelopParams` (as JSON + a fingerprint column), source fingerprint, and on-disk-cache pointer.
 - Scan only the direct children of a directory for the first MVP. Recursive scanning is deferred.
 - Single-screen layout: top ASCII banner (`TERMINALROOM`, ANSI-Shadow), then a horizontal split with the preview on the left and three fixed-width (28-cell) side tabs on the right — `Develop` (12 knobs), `Image Info` (shoot info + file info), `Navigation` (filmstrip with state badges). A 1-row focus-aware status line is at the bottom.
-- Two focus modes inside the main view: `Navigation` (default) handles image nav (`j`/`k`) and culling (`p`/`x`/`u`); `Develop` (entered via `Enter`, exited via `Esc`) handles knob nav (`j`/`k`) and adjustment (`h`/`l`, `r`). Image-nav keys are inert in Develop focus and vice versa — fully modal.
+- Two focus modes inside the main view: `Navigation` (default) handles image nav (`j`/`k`), remove (`x`), restore (`r`), and the show-removed toggle (`R`); `Develop` (entered via `Enter`, exited via `Esc`) handles knob nav (`j`/`k`) and adjustment (`h`/`l`, `r`). Image-nav keys are inert in Develop focus and vice versa — fully modal.
 - The currently focused side tab is drawn with a thick yellow border; the other tabs use the default border. Image Info is read-only and never gets focus.
 - Filter is a session-only modal popup. Toggling rebuilds the visible list without rescanning; selection survives toggles when the current file is still visible.
+- Removed files are filtered out of the visible list by default; pressing `R` toggles a session-only "show removed" view that brings them back in dimmed style with a red `R` badge. `r` on a currently-visible removed file restores it.
+- Develop knobs are persisted per file. Edits commit to the DB after a 250 ms debounce on the last knob press, and the same debounce gates re-rendering — quickly held arrow keys settle into one re-render after release. Force-flush on selection change, focus change, and quit ensures edits are never lost beyond the debounce window.
 - Image Info metadata (shoot info + dimensions) is populated lazily by the preview worker — when a job decodes a file, it includes a `FileMeta` in the result that `tui::mod` writes into `App.file_meta`.
 
 ## Implementation Status
@@ -55,10 +57,13 @@ Terminalroom is a terminal UI for culling and developing photographs. The first 
 - [x] `darkroom::pipeline` — `DevelopParams`, `develop_preview` (half-size demosaic + full knob chain), `develop_full` (full resolution).
 - [x] `darkroom::common` — `fit_within`, `resize_u8x3`, `resize_f32_planar` (per-plane via `fast_image_resize` `PixelType::F32`).
 - [x] `session` — file scanning (RAW + JPEG/PNG/TIFF), sort, fingerprint.
-- [x] `db` — SQLite v1 schema, migrations, `sync_files`, `set_state`.
-- [x] Single-screen TUI (ratatui + ratatui-image, single worker + `Srgb8` cache with `params_fingerprint`, format filter popup, aspect-fit centered preview, ASCII banner with single-row fallback).
-- [x] Develop tab + focus model (`Enter` enters, `Esc` exits; in-focus knob list driven by `j/k/h/l/r`; live re-render on knob change).
+- [x] `db` — global `~/.terminalroom/db.sqlite` v1 schema (`files` row carries removed flag + persisted DevelopParams JSON + cache pointer), `upsert_file`, `set_removed`, `update_params`, `set_cache_key`, `touch_access`, `oldest_cached`, `all_cache_keys`.
+- [x] `cache` — on-disk developed-image cache at `~/.terminalroom/cache/` (TRC1 header + CRC32, atomic write, BLAKE3 keying, LRU eviction tied to `last_access_unix_seconds`).
+- [x] `paths` — `~/.terminalroom/`, `db_path()`, `cache_dir()`, mkdir on first call.
+- [x] Single-screen TUI (ratatui + ratatui-image, single worker + two-tier `Srgb8` cache with `params_fingerprint`, format filter popup, aspect-fit centered preview, ASCII banner with single-row fallback).
+- [x] Develop tab + focus model (`Enter` enters, `Esc` exits; in-focus knob list driven by `j/k/h/l/r`; debounced 250 ms re-render + DB commit on knob change).
+- [x] Per-file develop persistence (knob edits debounced 250 ms; force-flush on selection/focus/quit).
+- [x] Remove/restore selection model (`x` remove, `r` restore, `R` toggle show-removed) replacing the old culling model.
 - [x] Image Info tab (shoot info from `ShotInfo` + file info; lazy populated by the worker via `FileMeta`).
 - [ ] End-to-end smoke test against a real RAW fixture.
-- [ ] Sidecar persistence for `DevelopParams` (post-MVP).
 - [ ] Export action (post-MVP, uses `develop_full`).

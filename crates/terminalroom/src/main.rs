@@ -5,6 +5,7 @@ use anyhow::Result;
 use clap::Parser;
 
 use terminalroom::app::App;
+use terminalroom::cache::Cache;
 use terminalroom::{db, session, tui};
 
 #[derive(Debug, Parser)]
@@ -17,10 +18,16 @@ struct Cli {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let session = session::discover(&cli.path)?;
-    let mut db = db::Db::open(&session.root)?;
-    let records = db.sync_files(&session.files, unix_now())?;
-    let mut app = App::init(session, db, records)?;
-    tui::run(&mut app)
+    let mut db = db::Db::open_global()?;
+    let now = unix_now();
+    let mut rows = Vec::with_capacity(session.files.len());
+    for f in &session.files {
+        rows.push(db.upsert_file(f, now)?);
+    }
+    let cache = Cache::new()?;
+    cache.prune_orphans(&db).ok();
+    let mut app = App::init(session, db, rows)?;
+    tui::run(&mut app, cache)
 }
 
 fn unix_now() -> i64 {

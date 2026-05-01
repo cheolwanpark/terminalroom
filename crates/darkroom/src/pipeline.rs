@@ -39,15 +39,15 @@ use crate::control::look::lookup;
 use crate::control::tone::{Blacks, Contrast, Shadows, SoftHighlights};
 use crate::space::{Buffer, CameraLinear, LinearRec2020, Srgb8};
 use crate::transform::camera::CameraToWorking;
-use crate::transform::encode::SrgbEncode;
-use crate::transform::matrix::Rec2020ToSrgb;
+use crate::transform::encode::{SrgbDecode, SrgbEncode};
+use crate::transform::matrix::{Rec2020ToSrgb, SrgbToRec2020};
 use crate::transform::oklab::{LinearToOklab, OklabToLinear, OklabToOklch, OklchToOklab};
 use crate::transform::{InPlaceTransform, Transform};
 
 /// User-facing develop parameters. All values are in the internal-normalized
 /// form (-1..=1 or 0..=1) except where physical units make sense (EV, Kelvin).
 /// Default is identity / no-op.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DevelopParams {
     pub exposure_ev: f32,
     pub temperature_kelvin: f32,
@@ -130,7 +130,7 @@ pub fn develop_preview(
         Loaded::Raw(raw) => {
             develop_raw_full(raw, params, target, /* half_size */ true, cancel)
         }
-        Loaded::Image(img) => develop_image_passthrough(img, target, cancel),
+        Loaded::Image(img) => develop_image_full(img, params, target, cancel),
     }
 }
 
@@ -157,7 +157,7 @@ pub fn develop_full(
                 cancel,
             )
         }
-        Loaded::Image(img) => develop_image_passthrough(img, effective_target, cancel),
+        Loaded::Image(img) => develop_image_full(img, params, effective_target, cancel),
     }
 }
 
@@ -260,28 +260,114 @@ fn develop_raw_full(
     Ok(SrgbEncode.apply(lin_srgb))
 }
 
-fn develop_image_passthrough(
+fn develop_image_full(
     img: &Image,
+    params: &DevelopParams,
     target: TargetSize,
     cancel: Option<&AtomicBool>,
 ) -> Result<Srgb8, DevelopError> {
+    // 1. Decode + resize to target. The result is interleaved sRGB 8-bit.
     let pixels = read_image_pixels(img, target, cancel).map_err(DevelopError::Decode)?;
     check_cancel(cancel)?;
 
     let (dst_w, dst_h) = fit_within(pixels.width, pixels.height, target);
-    if (dst_w, dst_h) == (pixels.width, pixels.height) {
-        return Ok(Srgb8 {
-            width: pixels.width,
-            height: pixels.height,
-            pixels: pixels.data,
-        });
+    let (srgb_w, srgb_h, srgb_pixels) = if (dst_w, dst_h) == (pixels.width, pixels.height) {
+        (pixels.width, pixels.height, pixels.data)
+    } else {
+        let resized = resize_u8x3(&pixels.data, pixels.width, pixels.height, dst_w, dst_h)?;
+        (dst_w, dst_h, resized)
+    };
+    let srgb8 = Srgb8 {
+        width: srgb_w,
+        height: srgb_h,
+        pixels: srgb_pixels,
+    };
+
+    // 2. sRGB 8-bit → linear sRGB. Image-format files don't have sensor/WB
+    // metadata, so Temperature and Tint are reinterpreted as plain per-channel
+    // gain in linear-light sRGB. Mathematically the same operation as the
+    // CameraLinear path; we just borrow the type tag to apply the controls.
+    let lin_srgb = SrgbDecode.apply(srgb8);
+    check_cancel(cancel)?;
+
+    let mut as_camera: Buffer<CameraLinear> = lin_srgb.into_space();
+    Temperature {
+        kelvin: params.temperature_kelvin,
     }
-    let resized = resize_u8x3(&pixels.data, pixels.width, pixels.height, dst_w, dst_h)?;
-    Ok(Srgb8 {
-        width: dst_w,
-        height: dst_h,
-        pixels: resized,
-    })
+    .apply(&mut as_camera);
+    Tint { value: params.tint }.apply(&mut as_camera);
+    let lin_srgb: Buffer<crate::space::LinearSrgb> = as_camera.into_space();
+
+    // 3. Linear sRGB → linear Rec.2020 (working space).
+    let mut buf = SrgbToRec2020.apply(lin_srgb);
+
+    // 4. Exposure (LinearRec2020).
+    Exposure {
+        ev: params.exposure_ev,
+    }
+    .apply(&mut buf);
+
+    // 4. Look + LookStrength via in-linear blend.
+    apply_look_with_strength(&params.look, params.look_strength, &mut buf);
+
+    // 5. Tone fine-tune (hue-preserving, in linear Rec.2020).
+    let iso = effective_iso(&img.shot_info);
+    Contrast {
+        value: params.contrast,
+    }
+    .apply(&mut buf);
+    SoftHighlights {
+        value: params.soft_highlights,
+    }
+    .tone()
+    .apply(&mut buf);
+    Shadows {
+        value: params.shadows,
+        iso,
+    }
+    .apply(&mut buf);
+    Blacks {
+        value: params.blacks,
+    }
+    .apply(&mut buf);
+    check_cancel(cancel)?;
+
+    // 6. Color stage in OKLab / OKLCh.
+    let lin_srgb = Rec2020ToSrgb.apply(buf);
+    let mut oklab = LinearToOklab.apply(lin_srgb);
+    Warmth {
+        value: params.warmth,
+    }
+    .apply(&mut oklab);
+    let mut oklch = OklabToOklch.apply(oklab);
+    SoftHighlights {
+        value: params.soft_highlights,
+    }
+    .chroma()
+    .apply(&mut oklch);
+    Color {
+        value: params.color,
+        iso,
+    }
+    .apply(&mut oklch);
+    Clarity {
+        value: params.clarity,
+        iso,
+    }
+    .apply(&mut oklch);
+    check_cancel(cancel)?;
+
+    // 7. Back to linear sRGB for grain + encode.
+    let oklab = OklchToOklab.apply(oklch);
+    let mut lin_srgb = OklabToLinear.apply(oklab);
+    Grain {
+        amount: params.grain,
+        iso,
+        seed: params.grain_seed,
+    }
+    .apply(&mut lin_srgb);
+
+    Ok(SrgbEncode.apply(lin_srgb))
 }
 
 /// Apply the named look at the given strength via in-linear lerp. For simple
@@ -347,6 +433,103 @@ mod tests {
         .unwrap();
         assert!(out.width <= 50 && out.height <= 50);
         assert_eq!(out.pixels.len() as u32, out.width * out.height * 3);
+    }
+
+    #[test]
+    fn develop_preview_jpeg_temperature_changes_output() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("a.jpg");
+        write_jpeg(&path, 64, 64, [128, 128, 128]);
+        let img = decode_image(&path).unwrap();
+        let loaded = Loaded::Image(img);
+        let neutral = develop_preview(
+            &loaded,
+            &DevelopParams::default(),
+            TargetSize::new(64, 64),
+            None,
+        )
+        .unwrap();
+        let mut warm_params = DevelopParams::default();
+        warm_params.temperature_kelvin = 4000.0;
+        let warm = develop_preview(&loaded, &warm_params, TargetSize::new(64, 64), None).unwrap();
+        // Warmer (lower K) should boost R and drop B in the rendered output.
+        let r_neutral = neutral.pixels.iter().step_by(3).map(|&x| x as u32).sum::<u32>();
+        let r_warm = warm.pixels.iter().step_by(3).map(|&x| x as u32).sum::<u32>();
+        assert!(r_warm > r_neutral, "warm R {r_warm} <= neutral R {r_neutral}");
+    }
+
+    #[test]
+    fn develop_preview_jpeg_clarity_changes_output() {
+        // Clarity is an unsharp mask on luminance — needs structure in the
+        // image to be visible. Write a checkerboard-ish JPEG and verify that
+        // strong clarity changes the pixels.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("checker.jpg");
+        let mut buf = ImageBuffer::<Rgb<u8>, _>::new(64, 64);
+        for y in 0..64u32 {
+            for x in 0..64u32 {
+                let c = if ((x / 8) + (y / 8)) % 2 == 0 {
+                    [200, 200, 200]
+                } else {
+                    [80, 80, 80]
+                };
+                buf.put_pixel(x, y, Rgb(c));
+            }
+        }
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgb8(buf)
+            .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Jpeg)
+            .unwrap();
+        std::fs::write(&path, bytes).unwrap();
+
+        let img = decode_image(&path).unwrap();
+        let loaded = Loaded::Image(img);
+        let neutral = develop_preview(
+            &loaded,
+            &DevelopParams::default(),
+            TargetSize::new(64, 64),
+            None,
+        )
+        .unwrap();
+        let mut clear_params = DevelopParams::default();
+        clear_params.clarity = 1.0;
+        let with_clarity =
+            develop_preview(&loaded, &clear_params, TargetSize::new(64, 64), None).unwrap();
+        // Clarity should perturb a significant portion of edge pixels in the
+        // checkerboard with a visible byte delta (>= 4 in u8).
+        let strongly_differing = neutral
+            .pixels
+            .iter()
+            .zip(with_clarity.pixels.iter())
+            .filter(|(a, b)| ((**a as i32) - (**b as i32)).abs() >= 4)
+            .count();
+        assert!(
+            strongly_differing > 200,
+            "clarity should produce visible (>=4 byte) change at edges; got {strongly_differing}"
+        );
+    }
+
+    #[test]
+    fn develop_preview_jpeg_tint_changes_output() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("a.jpg");
+        write_jpeg(&path, 64, 64, [128, 128, 128]);
+        let img = decode_image(&path).unwrap();
+        let loaded = Loaded::Image(img);
+        let neutral = develop_preview(
+            &loaded,
+            &DevelopParams::default(),
+            TargetSize::new(64, 64),
+            None,
+        )
+        .unwrap();
+        let mut tinted = DevelopParams::default();
+        tinted.tint = 0.8;
+        let out = develop_preview(&loaded, &tinted, TargetSize::new(64, 64), None).unwrap();
+        // Positive tint reduces G.
+        let g_neutral: u32 = neutral.pixels[1..].iter().step_by(3).map(|&x| x as u32).sum();
+        let g_out: u32 = out.pixels[1..].iter().step_by(3).map(|&x| x as u32).sum();
+        assert!(g_out < g_neutral, "tinted G {g_out} >= neutral G {g_neutral}");
     }
 
     #[test]

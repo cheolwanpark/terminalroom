@@ -82,7 +82,7 @@ Realized MVP behavior:
 - The main image area uses `StatefulImage::default().resize(Resize::Scale(None))` — `Scale` (not `Fit`) so the same display rect is filled regardless of source resolution; the terminal-cell size of the preview is computed by `aspect_fit_rect`.
 - A centered, aspect-preserving sub-rect (`aspect_fit_rect` in `tui::preview`) is computed from `(src_w, src_h)` and `picker.font_size()`. Landscape images use full preview width and center vertically; portrait images use full preview height and center horizontally. The sub-rect — not the full preview area — is what gets passed to `StatefulImage`.
 
-The right-side Navigation tab is text-only with state badges (`✓`/`✗`/`·`) — no per-row image rendering. This keeps the cache small and avoids per-frame encoding for filmstrip rows.
+The right-side Navigation tab is text-only — removed entries render dim with a red `R` badge, non-removed render plain. No per-row image rendering. This keeps the cache small and avoids per-frame encoding for filmstrip rows.
 
 ## SQLite and rusqlite
 
