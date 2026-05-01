@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -26,7 +26,8 @@ use ratatui_image::picker::Picker;
 use ratatui_image::protocol::StatefulProtocol;
 
 use darkroom::{
-    DevelopError, DevelopParams, ImageKind, Loaded, Srgb8, TargetSize, decode, develop_preview,
+    DevelopError, DevelopParams, ImageKind, Loaded, PreparedSource, Srgb8, TargetSize,
+    apply_pipeline, decode, prepare_source,
 };
 
 use crate::app::{App, FileMeta, Focus, View};
@@ -41,8 +42,16 @@ mod preview;
 mod status;
 
 const TICK: Duration = Duration::from_millis(100);
-const DEBOUNCE: Duration = Duration::from_millis(250);
+/// Debounce when the worker has not yet decoded the active source. Prevents
+/// firing a heavy decode on every knob tick.
+const DEBOUNCE_COLD: Duration = Duration::from_millis(250);
+/// Debounce when the worker has the active source cached. Drops to a value
+/// just above typical key-repeat (~30 ms) so knob ticks feel real-time.
+const DEBOUNCE_HOT: Duration = Duration::from_millis(50);
 const PREVIEW_CACHE_CAP: usize = 9;
+/// Capacity of the worker-side prepared-source cache. Each entry holds a
+/// target-sized `Buffer<CameraLinear>` (~18-36 MB at typical preview sizes).
+const SOURCE_CACHE_CAP: usize = 3;
 const TAB_WIDTH: u16 = 28;
 const SIDE_RESERVED_COLS: u16 = TAB_WIDTH * 3 + 2;
 const STATUS_RESERVED_ROWS: u16 = 1 + 2;
@@ -77,6 +86,45 @@ struct JobDone {
     meta: Option<FileMeta>,
 }
 
+/// Worker → main message about prepared-source cache state. Main keeps a
+/// `HashSet<PathBuf>` of paths the worker currently has decoded so the
+/// debounce can switch to `DEBOUNCE_HOT` on cache hits.
+#[derive(Debug)]
+enum CacheEvent {
+    Cached(PathBuf),
+    Evicted(PathBuf),
+}
+
+/// Key for the worker's prepared-source LRU. `target_bucket` quantizes the
+/// requested target so terminal-resize jitter doesn't churn the cache.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SourceKey {
+    path: PathBuf,
+    source_fp: u64,
+    target_bucket: (i32, i32),
+}
+
+/// Prepared source + the file metadata derived during decode (kept here so
+/// the worker doesn't need to redecode `Loaded` for `FileMeta` on cache hit).
+struct SourceEntry {
+    prepared: Arc<PreparedSource>,
+    meta: FileMeta,
+}
+
+/// Quantize a TargetSize into a coarse bucket. Two targets sit in the same
+/// bucket when both dimensions are within ~25% — matches the existing
+/// `target_changed_meaningfully` decision so cache reuse aligns with re-render
+/// decisions. Log-base-1.25 puts adjacent integer buckets ~25% apart.
+fn target_bucket(t: TargetSize) -> (i32, i32) {
+    fn b(v: u32) -> i32 {
+        if v == 0 {
+            return 0;
+        }
+        ((v as f64).ln() / 1.25_f64.ln()).round() as i32
+    }
+    (b(t.max_w), b(t.max_h))
+}
+
 struct TerminalGuard;
 
 impl Drop for TerminalGuard {
@@ -108,9 +156,10 @@ pub fn run(app: &mut App, disk_cache: DiskCache) -> Result<()> {
     let (job_tx, job_rx) = crossbeam_channel::unbounded::<Job>();
     let (done_tx, done_rx) = crossbeam_channel::unbounded::<JobDone>();
     let (event_tx, event_rx) = crossbeam_channel::unbounded::<Event>();
+    let (cache_tx, cache_rx) = crossbeam_channel::unbounded::<CacheEvent>();
 
     spawn_event_thread(event_tx);
-    spawn_worker(job_rx, done_tx);
+    spawn_worker(job_rx, done_tx, cache_tx);
 
     let mut mem_cache: LruCache<PathBuf, PreviewEntry> =
         LruCache::new(NonZeroUsize::new(PREVIEW_CACHE_CAP).unwrap());
@@ -122,11 +171,15 @@ pub fn run(app: &mut App, disk_cache: DiskCache) -> Result<()> {
     let mut current_generation: u64 = 0;
     let mut current_cancel: Option<Arc<AtomicBool>> = None;
     let mut latest_generation: HashMap<PathBuf, u64> = HashMap::new();
+    // Paths the worker currently has prepared in its source cache. Drives
+    // the tiered debounce: hot paths get DEBOUNCE_HOT, cold get DEBOUNCE_COLD.
+    let mut hot_paths: HashSet<PathBuf> = HashSet::new();
 
     loop {
-        // 1. Pending-edit detection. The timer is "250 ms after the LAST
-        //    adjust" — every fingerprint change resets it. Once the user stops
-        //    adjusting and 250 ms elapses, we flush.
+        // 1. Pending-edit detection. The timer resets on every fingerprint
+        //    change; once the user stops adjusting and the active debounce
+        //    elapses, we flush. Debounce is tiered: hot paths (worker has
+        //    decoded source cached) use DEBOUNCE_HOT, cold paths DEBOUNCE_COLD.
         let pending = pending_develop_change(app);
         if pending {
             let live_fp = app.develop_params.fingerprint();
@@ -139,9 +192,14 @@ pub fn run(app: &mut App, disk_cache: DiskCache) -> Result<()> {
             last_dirty_fp = None;
         }
 
+        let active_debounce = match app.current().map(|e| &e.file.canonical_path) {
+            Some(p) if hot_paths.contains(p) => DEBOUNCE_HOT,
+            _ => DEBOUNCE_COLD,
+        };
+
         // 2. Debounced flush: persist pending edits + commit once the timer
-        //    has lain idle for DEBOUNCE.
-        if pending && params_dirty_at.is_some_and(|t| t.elapsed() >= DEBOUNCE) {
+        //    has lain idle for the active debounce window.
+        if pending && params_dirty_at.is_some_and(|t| t.elapsed() >= active_debounce) {
             flush_pending_develop(app, now_unix());
             params_dirty_at = None;
             last_dirty_fp = None;
@@ -222,7 +280,10 @@ pub fn run(app: &mut App, disk_cache: DiskCache) -> Result<()> {
 
         // 5. Wait for events, bounding the timeout by the remaining debounce.
         let timeout = match params_dirty_at {
-            Some(t) => DEBOUNCE.saturating_sub(t.elapsed()).min(TICK).max(Duration::from_millis(5)),
+            Some(t) => active_debounce
+                .saturating_sub(t.elapsed())
+                .min(TICK)
+                .max(Duration::from_millis(5)),
             None => TICK,
         };
 
@@ -253,6 +314,13 @@ pub fn run(app: &mut App, disk_cache: DiskCache) -> Result<()> {
                     app,
                     &latest_generation,
                 );
+            }
+            recv(cache_rx) -> ev => {
+                let Ok(ev) = ev else { break; };
+                match ev {
+                    CacheEvent::Cached(p) => { hot_paths.insert(p); }
+                    CacheEvent::Evicted(p) => { hot_paths.remove(&p); }
+                }
             }
             default(timeout) => {}
         }
@@ -329,8 +397,10 @@ fn spawn_event_thread(tx: Sender<Event>) {
     });
 }
 
-fn spawn_worker(rx: Receiver<Job>, tx: Sender<JobDone>) {
+fn spawn_worker(rx: Receiver<Job>, tx: Sender<JobDone>, cache_tx: Sender<CacheEvent>) {
     thread::spawn(move || {
+        let mut source_cache: LruCache<SourceKey, SourceEntry> =
+            LruCache::new(NonZeroUsize::new(SOURCE_CACHE_CAP).unwrap());
         while let Ok(job) = rx.recv() {
             let Job {
                 path,
@@ -342,18 +412,92 @@ fn spawn_worker(rx: Receiver<Job>, tx: Sender<JobDone>) {
                 source_fp,
                 size_bytes,
             } = job;
-            let (result, meta) = if cancel.load(Ordering::Relaxed) {
-                (Err(DevelopError::Cancelled), None)
+
+            if cancel.load(Ordering::Relaxed) {
+                if tx
+                    .send(JobDone {
+                        path,
+                        generation,
+                        target,
+                        params_fingerprint,
+                        source_fp,
+                        result: Err(DevelopError::Cancelled),
+                        meta: None,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                continue;
+            }
+
+            let key = SourceKey {
+                path: path.clone(),
+                source_fp,
+                target_bucket: target_bucket(target),
+            };
+
+            // Cache hit: skip decode + resize entirely.
+            let (prepared, meta) = if let Some(entry) = source_cache.get(&key) {
+                (entry.prepared.clone(), Some(entry.meta.clone()))
             } else {
                 match decode(&path) {
                     Ok(loaded) => {
                         let meta = file_meta_from(&loaded, size_bytes);
-                        let r = develop_preview(&loaded, &params, target, Some(&cancel));
-                        (r, Some(meta))
+                        match prepare_source(&loaded, target, Some(&cancel)) {
+                            Ok(prep) => {
+                                let prepared = Arc::new(prep);
+                                let entry = SourceEntry {
+                                    prepared: prepared.clone(),
+                                    meta: meta.clone(),
+                                };
+                                if let Some((evicted_key, _)) = source_cache.push(key, entry) {
+                                    let _ = cache_tx
+                                        .send(CacheEvent::Evicted(evicted_key.path));
+                                }
+                                let _ = cache_tx.send(CacheEvent::Cached(path.clone()));
+                                (prepared, Some(meta))
+                            }
+                            Err(e) => {
+                                if tx
+                                    .send(JobDone {
+                                        path,
+                                        generation,
+                                        target,
+                                        params_fingerprint,
+                                        source_fp,
+                                        result: Err(e),
+                                        meta: Some(meta),
+                                    })
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                                continue;
+                            }
+                        }
                     }
-                    Err(e) => (Err(DevelopError::Decode(e)), None),
+                    Err(e) => {
+                        if tx
+                            .send(JobDone {
+                                path,
+                                generation,
+                                target,
+                                params_fingerprint,
+                                source_fp,
+                                result: Err(DevelopError::Decode(e)),
+                                meta: None,
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                        continue;
+                    }
                 }
             };
+
+            let result = apply_pipeline(&prepared, &params, Some(&cancel));
             if tx
                 .send(JobDone {
                     path,

@@ -7,7 +7,9 @@ pub mod space;
 pub mod transform;
 
 pub use common::DevelopError;
-pub use pipeline::{DevelopParams, develop_full, develop_preview};
+pub use pipeline::{
+    DevelopParams, PreparedSource, apply_pipeline, develop_full, develop_preview, prepare_source,
+};
 pub use space::Srgb8;
 
 pub use codec::{

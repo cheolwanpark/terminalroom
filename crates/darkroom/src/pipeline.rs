@@ -28,7 +28,9 @@
 
 use std::sync::atomic::AtomicBool;
 
-use codec::{Image, Loaded, Raw, ShotInfo, TargetSize, read_camera_linear, read_image_pixels};
+use codec::{
+    Image, Loaded, Raw, SensorInfo, ShotInfo, TargetSize, read_camera_linear, read_image_pixels,
+};
 
 use crate::common::{DevelopError, check_cancel, fit_within, resize_f32_planar, resize_u8x3};
 use crate::control::Control;
@@ -37,7 +39,7 @@ use crate::control::detail::{Clarity, Grain};
 use crate::control::input::{Exposure, Temperature, Tint};
 use crate::control::look::lookup;
 use crate::control::tone::{Blacks, Contrast, Shadows, SoftHighlights};
-use crate::space::{Buffer, CameraLinear, LinearRec2020, Srgb8};
+use crate::space::{Buffer, CameraLinear, LinearRec2020, LinearSrgb, Srgb8};
 use crate::transform::camera::CameraToWorking;
 use crate::transform::encode::{SrgbDecode, SrgbEncode};
 use crate::transform::matrix::{Rec2020ToSrgb, SrgbToRec2020};
@@ -118,155 +120,83 @@ impl DevelopParams {
     }
 }
 
-/// Develop a `Loaded` to an 8-bit sRGB preview at or below `target` with
-/// preview-quality settings (libraw `half_size = true` for RAW).
-pub fn develop_preview(
+/// Param-independent prepared source: decoded + resized to a CameraLinear
+/// buffer ready for [`apply_pipeline`]. Cache this in the worker keyed by
+/// `(path, source_fp, target_bucket)` so knob ticks skip decode + resize.
+#[derive(Debug, Clone)]
+pub enum PreparedSource {
+    /// RAW path: post-`read_camera_linear`, post-resize. `sensor_info` is
+    /// needed by `CameraToWorking`; `shot_info` for `effective_iso`.
+    Raw {
+        buf: Buffer<CameraLinear>,
+        sensor_info: SensorInfo,
+        shot_info: ShotInfo,
+    },
+    /// Image path: post-decode, post-resize, post-`SrgbDecode`, retagged as
+    /// `CameraLinear` (zero-cost) so Temperature/Tint can run uniformly.
+    Image {
+        buf: Buffer<CameraLinear>,
+        shot_info: ShotInfo,
+    },
+}
+
+impl PreparedSource {
+    /// Dimensions of the prepared (target-sized) buffer. Useful for logging.
+    pub fn dimensions(&self) -> (u32, u32) {
+        match self {
+            Self::Raw { buf, .. } => buf.dimensions(),
+            Self::Image { buf, .. } => buf.dimensions(),
+        }
+    }
+}
+
+/// Decode + resize a `Loaded` into a [`PreparedSource`] at preview quality
+/// (libraw `half_size = true` for RAW). All work here is param-independent —
+/// safe to cache and reuse across knob changes.
+pub fn prepare_source(
     loaded: &Loaded,
-    params: &DevelopParams,
     target: TargetSize,
     cancel: Option<&AtomicBool>,
-) -> Result<Srgb8, DevelopError> {
-    match loaded {
-        Loaded::Raw(raw) => {
-            develop_raw_full(raw, params, target, /* half_size */ true, cancel)
-        }
-        Loaded::Image(img) => develop_image_full(img, params, target, cancel),
-    }
+) -> Result<PreparedSource, DevelopError> {
+    prepare_source_inner(loaded, target, /* half_size */ true, cancel)
 }
 
-/// Develop a `Loaded` to an 8-bit sRGB output at full quality (libraw
-/// `half_size = false`). `target = None` develops at source resolution; some
-/// `Some(t)` develops at-or-below `t`.
-pub fn develop_full(
+fn prepare_source_inner(
     loaded: &Loaded,
-    params: &DevelopParams,
-    target: Option<TargetSize>,
-    cancel: Option<&AtomicBool>,
-) -> Result<Srgb8, DevelopError> {
-    let effective_target = target.unwrap_or_else(|| {
-        let (w, h) = loaded.dimensions();
-        TargetSize::new(w.max(1), h.max(1))
-    });
-    match loaded {
-        Loaded::Raw(raw) => {
-            develop_raw_full(
-                raw,
-                params,
-                effective_target,
-                /* half_size */ false,
-                cancel,
-            )
-        }
-        Loaded::Image(img) => develop_image_full(img, params, effective_target, cancel),
-    }
-}
-
-fn develop_raw_full(
-    raw: &Raw,
-    params: &DevelopParams,
     target: TargetSize,
     half_size: bool,
     cancel: Option<&AtomicBool>,
-) -> Result<Srgb8, DevelopError> {
-    // 1. Read camera-linear (no WB, no matrix).
+) -> Result<PreparedSource, DevelopError> {
+    match loaded {
+        Loaded::Raw(raw) => prepare_raw(raw, target, half_size, cancel),
+        Loaded::Image(img) => prepare_image(img, target, cancel),
+    }
+}
+
+fn prepare_raw(
+    raw: &Raw,
+    target: TargetSize,
+    half_size: bool,
+    cancel: Option<&AtomicBool>,
+) -> Result<PreparedSource, DevelopError> {
     let pixels = read_camera_linear(raw, half_size, cancel).map_err(DevelopError::Decode)?;
     check_cancel(cancel)?;
     let buf = Buffer::<CameraLinear>::from_planar(pixels.data, pixels.width, pixels.height);
-
-    // 2. Resize to target — transforms run on the smaller buffer.
     let (dst_w, dst_h) = fit_within(buf.width(), buf.height(), target);
-    let mut buf = resize_f32_planar(buf, dst_w, dst_h)?;
+    let buf = resize_f32_planar(buf, dst_w, dst_h)?;
     check_cancel(cancel)?;
-
-    // 3. Input controls in camera-linear.
-    Temperature {
-        kelvin: params.temperature_kelvin,
-    }
-    .apply(&mut buf);
-    Tint { value: params.tint }.apply(&mut buf);
-
-    // 4. Camera → working linear Rec.2020.
-    let xform = CameraToWorking::from_sensor(&raw.sensor_info);
-    let mut buf = xform.apply(buf);
-    check_cancel(cancel)?;
-
-    // 5. Exposure.
-    Exposure {
-        ev: params.exposure_ev,
-    }
-    .apply(&mut buf);
-
-    // 6. Look + LookStrength via in-linear blend.
-    apply_look_with_strength(&params.look, params.look_strength, &mut buf);
-
-    // 7. Tone fine-tune (hue-preserving, in linear Rec.2020).
-    let iso = effective_iso(&raw.shot_info);
-    Contrast {
-        value: params.contrast,
-    }
-    .apply(&mut buf);
-    SoftHighlights {
-        value: params.soft_highlights,
-    }
-    .tone()
-    .apply(&mut buf);
-    Shadows {
-        value: params.shadows,
-        iso,
-    }
-    .apply(&mut buf);
-    Blacks {
-        value: params.blacks,
-    }
-    .apply(&mut buf);
-    check_cancel(cancel)?;
-
-    // 8. Color stage in OKLab / OKLCh.
-    let lin_srgb = Rec2020ToSrgb.apply(buf);
-    let mut oklab = LinearToOklab.apply(lin_srgb);
-    Warmth {
-        value: params.warmth,
-    }
-    .apply(&mut oklab);
-    let mut oklch = OklabToOklch.apply(oklab);
-    SoftHighlights {
-        value: params.soft_highlights,
-    }
-    .chroma()
-    .apply(&mut oklch);
-    Color {
-        value: params.color,
-        iso,
-    }
-    .apply(&mut oklch);
-    Clarity {
-        value: params.clarity,
-        iso,
-    }
-    .apply(&mut oklch);
-    check_cancel(cancel)?;
-
-    // 9. Back to linear sRGB for grain + encode.
-    let oklab = OklchToOklab.apply(oklch);
-    let mut lin_srgb = OklabToLinear.apply(oklab);
-    Grain {
-        amount: params.grain,
-        iso,
-        seed: params.grain_seed,
-    }
-    .apply(&mut lin_srgb);
-
-    // 10. Encode.
-    Ok(SrgbEncode.apply(lin_srgb))
+    Ok(PreparedSource::Raw {
+        buf,
+        sensor_info: raw.sensor_info.clone(),
+        shot_info: raw.shot_info.clone(),
+    })
 }
 
-fn develop_image_full(
+fn prepare_image(
     img: &Image,
-    params: &DevelopParams,
     target: TargetSize,
     cancel: Option<&AtomicBool>,
-) -> Result<Srgb8, DevelopError> {
-    // 1. Decode + resize to target. The result is interleaved sRGB 8-bit.
+) -> Result<PreparedSource, DevelopError> {
     let pixels = read_image_pixels(img, target, cancel).map_err(DevelopError::Decode)?;
     check_cancel(cancel)?;
 
@@ -282,36 +212,77 @@ fn develop_image_full(
         height: srgb_h,
         pixels: srgb_pixels,
     };
-
-    // 2. sRGB 8-bit → linear sRGB. Image-format files don't have sensor/WB
-    // metadata, so Temperature and Tint are reinterpreted as plain per-channel
-    // gain in linear-light sRGB. Mathematically the same operation as the
-    // CameraLinear path; we just borrow the type tag to apply the controls.
     let lin_srgb = SrgbDecode.apply(srgb8);
     check_cancel(cancel)?;
+    // Image-format files don't have sensor/WB metadata, so Temperature and
+    // Tint are reinterpreted as plain per-channel gain in linear-light sRGB.
+    // Mathematically the same operation as the CameraLinear path; we just
+    // borrow the type tag (zero-cost retag).
+    let buf: Buffer<CameraLinear> = lin_srgb.into_space();
+    Ok(PreparedSource::Image {
+        buf,
+        shot_info: img.shot_info.clone(),
+    })
+}
 
-    let mut as_camera: Buffer<CameraLinear> = lin_srgb.into_space();
+/// Apply the param-dependent develop pipeline to a [`PreparedSource`].
+/// Clones the cached buffer once at entry; the rest of the pipeline owns its
+/// data. ~0.4 ms memcpy at ~18 MB preview size — negligible vs. pipeline cost.
+pub fn apply_pipeline(
+    src: &PreparedSource,
+    params: &DevelopParams,
+    cancel: Option<&AtomicBool>,
+) -> Result<Srgb8, DevelopError> {
+    match src {
+        PreparedSource::Raw {
+            buf,
+            sensor_info,
+            shot_info,
+        } => apply_from_camera_linear(buf.clone(), TailMeta::Raw { sensor_info }, shot_info, params, cancel),
+        PreparedSource::Image { buf, shot_info } => {
+            apply_from_camera_linear(buf.clone(), TailMeta::Image, shot_info, params, cancel)
+        }
+    }
+}
+
+enum TailMeta<'a> {
+    Raw { sensor_info: &'a SensorInfo },
+    Image,
+}
+
+fn apply_from_camera_linear(
+    mut buf: Buffer<CameraLinear>,
+    meta: TailMeta<'_>,
+    shot_info: &ShotInfo,
+    params: &DevelopParams,
+    cancel: Option<&AtomicBool>,
+) -> Result<Srgb8, DevelopError> {
+    // Input controls in camera-linear (or per-channel gain for image-format).
     Temperature {
         kelvin: params.temperature_kelvin,
     }
-    .apply(&mut as_camera);
-    Tint { value: params.tint }.apply(&mut as_camera);
-    let lin_srgb: Buffer<crate::space::LinearSrgb> = as_camera.into_space();
+    .apply(&mut buf);
+    Tint { value: params.tint }.apply(&mut buf);
 
-    // 3. Linear sRGB → linear Rec.2020 (working space).
-    let mut buf = SrgbToRec2020.apply(lin_srgb);
+    // Camera → working linear Rec.2020. RAW uses the sensor matrix; image
+    // routes through linear sRGB → Rec.2020 since it has no sensor opinion.
+    let mut buf: Buffer<LinearRec2020> = match meta {
+        TailMeta::Raw { sensor_info } => CameraToWorking::from_sensor(sensor_info).apply(buf),
+        TailMeta::Image => {
+            let lin_srgb: Buffer<LinearSrgb> = buf.into_space();
+            SrgbToRec2020.apply(lin_srgb)
+        }
+    };
+    check_cancel(cancel)?;
 
-    // 4. Exposure (LinearRec2020).
     Exposure {
         ev: params.exposure_ev,
     }
     .apply(&mut buf);
 
-    // 4. Look + LookStrength via in-linear blend.
     apply_look_with_strength(&params.look, params.look_strength, &mut buf);
 
-    // 5. Tone fine-tune (hue-preserving, in linear Rec.2020).
-    let iso = effective_iso(&img.shot_info);
+    let iso = effective_iso(shot_info);
     Contrast {
         value: params.contrast,
     }
@@ -332,7 +303,7 @@ fn develop_image_full(
     .apply(&mut buf);
     check_cancel(cancel)?;
 
-    // 6. Color stage in OKLab / OKLCh.
+    // Color stage in OKLab / OKLCh.
     let lin_srgb = Rec2020ToSrgb.apply(buf);
     let mut oklab = LinearToOklab.apply(lin_srgb);
     Warmth {
@@ -357,7 +328,7 @@ fn develop_image_full(
     .apply(&mut oklch);
     check_cancel(cancel)?;
 
-    // 7. Back to linear sRGB for grain + encode.
+    // Back to linear sRGB for grain + encode.
     let oklab = OklchToOklab.apply(oklch);
     let mut lin_srgb = OklabToLinear.apply(oklab);
     Grain {
@@ -368,6 +339,37 @@ fn develop_image_full(
     .apply(&mut lin_srgb);
 
     Ok(SrgbEncode.apply(lin_srgb))
+}
+
+/// Develop a `Loaded` to an 8-bit sRGB preview at or below `target` with
+/// preview-quality settings (libraw `half_size = true` for RAW). Equivalent
+/// to `apply_pipeline(&prepare_source(...)?, ...)` — convenience for callers
+/// that don't want to manage a [`PreparedSource`] cache.
+pub fn develop_preview(
+    loaded: &Loaded,
+    params: &DevelopParams,
+    target: TargetSize,
+    cancel: Option<&AtomicBool>,
+) -> Result<Srgb8, DevelopError> {
+    let prepared = prepare_source(loaded, target, cancel)?;
+    apply_pipeline(&prepared, params, cancel)
+}
+
+/// Develop a `Loaded` to an 8-bit sRGB output at full quality (libraw
+/// `half_size = false`). `target = None` develops at source resolution; some
+/// `Some(t)` develops at-or-below `t`.
+pub fn develop_full(
+    loaded: &Loaded,
+    params: &DevelopParams,
+    target: Option<TargetSize>,
+    cancel: Option<&AtomicBool>,
+) -> Result<Srgb8, DevelopError> {
+    let effective_target = target.unwrap_or_else(|| {
+        let (w, h) = loaded.dimensions();
+        TargetSize::new(w.max(1), h.max(1))
+    });
+    let prepared = prepare_source_inner(loaded, effective_target, /* half_size */ false, cancel)?;
+    apply_pipeline(&prepared, params, cancel)
 }
 
 /// Apply the named look at the given strength via in-linear lerp. For simple
