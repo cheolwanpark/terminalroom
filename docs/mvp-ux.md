@@ -181,16 +181,27 @@ Metadata is populated lazily by the preview worker — the first time a file is 
 
 When the selected file changes, the terminal resize moves the preview target ≥ 25% in either dim, or a develop knob is adjusted (the `DevelopParams` fingerprint changes):
 
-1. Show whatever the cache already holds for the new file *if* its `params_fingerprint` matches the current one.
-2. Bump a per-selection generation and flip the prior selection's cancel flag, then enqueue one job for the new selection at the new target size and current params. Each job carries an `Arc<AtomicBool>` cancel flag, a clone of the `DevelopParams`, and the file's `size_bytes`.
+1. The preview pane reads from `displayed_path`, not the live cursor. While a held-key nav burst is in flight, `displayed_path` stays pinned to the last settled file so the pane shows that image stably (and after release, stays on it until the new file's preview lands in the cache rather than dropping to "loading…" text).
+2. Both disk-cache installs and worker dispatch are gated on `NAV_SETTLE = 150 ms` of nav-input silence (anchored on the most recent nav event). Once settled: bump a per-selection generation and flip the prior selection's cancel flag, then enqueue one job for the new selection at the new target size and current params. Each job carries an `Arc<AtomicBool>` cancel flag, a clone of the `DevelopParams`, and the file's `size_bytes`.
 3. The worker calls `darkroom::decode` (cheap header read), builds a `FileMeta` from the result, and runs `pipeline::develop_preview`:
    - `Raw` → `codec::read_camera_linear` (libraw `output_color=Raw`, `use_camera_wb=false`, Raw-mode `no_auto_scale=true`, `half_size=true` for preview) → planar f32 buffer normalized against sensor white after black subtraction → resize to target → `CameraToWorking` (WB + LibRaw-aligned cam→Rec.2020) → 12-knob chain → `Rec2020ToSrgb` → `SrgbEncode`.
    - `Jpeg` → `read_image_pixels` via `jpeg-decoder` with IDCT `.scale()` to the target size.
    - `Png` / `Tiff` → `read_image_pixels` via `image::ImageReader::open` at native resolution, then resize.
    EXIF orientation is read at decode time and applied so portraits render upright. For RAW the libraw `flip` code drives auto-rotate inside `read_demosaiced` (`params.user_flip = -1`).
-4. Results land in the LRU preview cache (capacity 9, keyed by canonical path) as `PreviewEntry { proto, src_w, src_h, rendered_target, params_fingerprint }`. The `FileMeta` is written into `App.file_meta`. Stale results from prior generations are dropped on receive.
+4. Results land in the LRU preview cache (capacity 15, keyed by canonical path) as `PreviewEntry { proto, src_w, src_h, rendered_target, params_fingerprint }`. The `FileMeta` is written into `App.file_meta`. Stale results from prior generations are dropped on receive. When an entry is replaced or LRU-evicted the kitty `_Ga=d,d=I,i={id};` delete escape is emitted so the terminal frees the image's quota.
 5. The image area renders the cached preview at a centered aspect-fit sub-rect — landscape uses the full preview width centered vertically, portrait uses the full preview height centered horizontally.
 6. If decoding fails, the cache stays empty for that file and a text placeholder is shown with the error surfaced in the status line.
+
+### Held-key navigation
+
+Holding `j` / `k` (or `↓` / `↑`) in Navigation focus goes through a rate-limiter:
+
+- The initial press advances the cursor immediately.
+- For the first second of holding, the cursor advances at 5 Hz (one step per 200 ms) regardless of the OS auto-repeat rate — so the user can read what's flying past in the navigation list.
+- After one second, the rate limit lifts and the cursor advances at the full incoming event rate.
+- The preview pane stays frozen on whichever file was loaded before the burst started; image dispatch only fires after release, when nav input has been silent for 150 ms.
+
+Single taps and slow tapping (>350 ms apart) bypass the rate limit — each press advances the cursor on its own.
 
 ## Acceptance Criteria
 

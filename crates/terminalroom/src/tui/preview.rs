@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use lru::LruCache;
 use ratatui::Frame;
@@ -13,6 +13,7 @@ pub fn render(
     frame: &mut Frame,
     app: &App,
     cache: &mut LruCache<PathBuf, PreviewEntry>,
+    displayed_path: Option<&Path>,
     area: Rect,
     font_size: (u16, u16),
 ) {
@@ -20,13 +21,17 @@ pub fn render(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let Some(entry) = app.current() else {
+    if app.current().is_none() {
         let p = Paragraph::new("No images match the current filter.").wrap(Wrap { trim: true });
         frame.render_widget(p, inner);
         return;
-    };
+    }
 
-    let preview = cache.get_mut(&entry.file.canonical_path);
+    // Always render the *displayed* path, not the live cursor. While a
+    // held-key nav burst is in flight, `displayed_path` stays at the last
+    // settled file so the preview pane doesn't flicker through every cached
+    // image the cursor scrolls past.
+    let preview = displayed_path.and_then(|p| cache.get_mut(p));
 
     if let Some(preview) = preview {
         let centered = aspect_fit_rect(inner, preview.src_w, preview.src_h, font_size);

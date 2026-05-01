@@ -22,7 +22,8 @@ use ratatui::layout::{Constraint, Layout, Size};
 use ratatui::style::{Color, Style};
 use ratatui::widgets::{Block, BorderType, Borders};
 use ratatui_image::Resize;
-use ratatui_image::picker::Picker;
+use ratatui_image::picker::cap_parser::Parser as CapParser;
+use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::StatefulProtocol;
 
 use darkroom::{
@@ -61,6 +62,21 @@ const SOURCE_CACHE_CAP: usize = 3;
 /// scrolling. Once the cursor sits still for `NAV_SETTLE`, the next
 /// iteration kicks off the real preview for whatever the cursor is on.
 const NAV_SETTLE: Duration = Duration::from_millis(150);
+/// Two same-direction nav keypresses within this gap are treated as part of
+/// the same key-repeat burst. Set above the typical OS auto-repeat *delay*
+/// (~250 ms on macOS) so the very first auto-repeat is classified as a
+/// continuation of the initial press; otherwise the 1-second slow phase
+/// would start at the first auto-repeat instead of the keypress, pushing
+/// the slow→fast transition out to ~1.3 s.
+const NAV_BURST_GAP: Duration = Duration::from_millis(350);
+/// Minimum spacing between cursor advances during the *slow phase* of a held
+/// burst. Holding j/k initially advances at 5 Hz so the user can read the
+/// names flying by; after `NAV_RAMP_DURATION` the rate-limit is dropped and
+/// the cursor moves at OS-repeat speed.
+const NAV_SLOW_INTERVAL: Duration = Duration::from_millis(200);
+/// How long a held burst stays in the slow phase before ramping up to full
+/// auto-repeat speed.
+const NAV_RAMP_DURATION: Duration = Duration::from_millis(1000);
 const TAB_WIDTH: u16 = 28;
 const SIDE_RESERVED_COLS: u16 = TAB_WIDTH * 3 + 2;
 const STATUS_RESERVED_ROWS: u16 = 1 + 2;
@@ -194,6 +210,7 @@ pub fn run(app: &mut App, disk_cache: DiskCache) -> Result<()> {
             Picker::from_fontsize((1, 2))
         }
     };
+    let is_tmux = detect_is_tmux();
 
     // Develop job channel is bounded(1) so the queue can hold at most "the
     // next pending job" while one is in flight. The cancel-flag pattern
@@ -233,10 +250,15 @@ pub fn run(app: &mut App, disk_cache: DiskCache) -> Result<()> {
     // flag for that job; we flip it when the path falls outside the cursor±1
     // window. Removed when the matching JobDone arrives or on cancellation.
     let mut prefetch_cancels: HashMap<PathBuf, Arc<AtomicBool>> = HashMap::new();
-    // Set whenever the cursor jumps to a new file; used to gate develop
-    // dispatch + prefetch on a brief settle window so a held key burst
-    // doesn't queue 30 jobs that all immediately get cancelled.
-    let mut last_cursor_change_at: Option<Instant> = None;
+    // Held-key nav state: rate-limits cursor advances during a burst (slow
+    // for the first second, then full speed), and serves as the "user is
+    // still pressing keys" signal that gates image dispatch via NAV_SETTLE.
+    let mut nav = NavCoalesce::default();
+    // Path the preview pane is currently showing. Updated only on settled
+    // iterations once the target path is in mem_cache, so a held-key burst
+    // doesn't flash the preview through every previously-cached file the
+    // cursor scrolls over.
+    let mut displayed_path: Option<PathBuf> = None;
 
     loop {
         // 0. Drain all queued input events first. With OS key-repeat at
@@ -245,7 +267,7 @@ pub fn run(app: &mut App, disk_cache: DiskCache) -> Result<()> {
         //    the burst into a single iteration. Any further events that
         //    arrive while we render get caught by the next iteration's drain
         //    or the recv(event_rx) arm in select!.
-        match drain_input_events(app, &event_rx, &save_tx) {
+        match drain_input_events(app, &event_rx, &save_tx, &mut nav) {
             EventDrain::Quit => {
                 if pending_develop_change(app) {
                     flush_pending_develop(app, &save_tx, now_unix());
@@ -304,13 +326,12 @@ pub fn run(app: &mut App, disk_cache: DiskCache) -> Result<()> {
         let selection_changed = current_id != last_id;
         let render_fp_changed = render_fp != last_rendered_fp;
 
-        // Track when the cursor last jumped. When the user holds j/k the
-        // cursor changes every iteration; this timer keeps refreshing and
-        // we suppress develop work until it stops moving.
-        if selection_changed {
-            last_cursor_change_at = Some(Instant::now());
-        }
-        let nav_settled = last_cursor_change_at
+        // "User has stopped pressing nav keys for NAV_SETTLE." Anchored on
+        // the most recent nav *input*, not on the most recent cursor advance,
+        // so rate-limited advances during a burst don't accidentally let
+        // nav_settled flip true between two advances.
+        let nav_settled = nav
+            .last_input_at
             .map(|t| t.elapsed() >= NAV_SETTLE)
             .unwrap_or(true);
 
@@ -338,15 +359,31 @@ pub fn run(app: &mut App, disk_cache: DiskCache) -> Result<()> {
                 // retries once nav_settled flips true.
                 let mut resolved = in_memory_hit;
 
-                if !in_memory_hit {
+                if !in_memory_hit && nav_settled {
+                    // Both disk-cache install and worker dispatch are gated on
+                    // nav_settled — during a held burst we don't want to
+                    // install previously-decoded entries for every cursor
+                    // position the user scrolls through (each install mutates
+                    // mem_cache and re-transmits a kitty image, which would
+                    // be visibly flashed in the preview pane below).
                     if let Some(srgb8) =
                         disk_cache.get(&path, src_fp, rfp, &mut app.db, now_unix())
                     {
-                        install_in_memory(&mut mem_cache, &picker, &path, target, rfp, srgb8, app);
+                        install_in_memory(
+                            &mut mem_cache,
+                            &picker,
+                            is_tmux,
+                            &path,
+                            target,
+                            rfp,
+                            srgb8,
+                            app,
+                        );
                         resolved = true;
-                    } else if nav_settled {
-                        // Settled: dispatch a real develop job for the
-                        // current cursor.
+                    } else {
+                        // Settled (no nav input for NAV_SETTLE → user has
+                        // released the key): dispatch a real develop job for
+                        // the cursor's final position.
                         current_generation = current_generation.saturating_add(1);
                         let cancel = Arc::new(AtomicBool::new(false));
                         current_cancel = Some(cancel.clone());
@@ -364,11 +401,11 @@ pub fn run(app: &mut App, disk_cache: DiskCache) -> Result<()> {
                         });
                         resolved = true;
                     }
-                    // else: still scrolling — defer dispatch to the next
-                    // iteration after NAV_SETTLE elapses. The preview pane
-                    // will show whatever's in mem_cache for the current
-                    // cursor (or "loading…" on a miss) until then.
                 }
+                // else (still scrolling): defer to the next iteration after
+                // NAV_SETTLE elapses. The preview pane is frozen on the last
+                // settled path via `displayed_path` below, so the user
+                // doesn't see flicker.
 
                 if resolved {
                     last_target = Some(target);
@@ -395,10 +432,21 @@ pub fn run(app: &mut App, disk_cache: DiskCache) -> Result<()> {
             last_rendered_fp = None;
         }
 
+        // Decide what the preview pane should show this frame. While a
+        // burst is active we keep showing the last settled image so the
+        // user has a stable reference; once the burst settles and the new
+        // target is in mem_cache, switch.
+        if nav_settled
+            && let Some(curr_path) = current_path.as_ref()
+            && mem_cache.contains(curr_path)
+        {
+            displayed_path = Some(curr_path.clone());
+        }
+
         // 4. Draw.
         let font_size = picker.font_size();
         terminal
-            .draw(|frame| draw(frame, app, &mut mem_cache, font_size))
+            .draw(|frame| draw(frame, app, &mut mem_cache, displayed_path.as_deref(), font_size))
             .context("failed to draw frame")?;
 
         // 5. Wait for events, bounding the timeout by the remaining debounce
@@ -409,7 +457,9 @@ pub fn run(app: &mut App, disk_cache: DiskCache) -> Result<()> {
         if let Some(t) = params_dirty_at {
             timeout = timeout.min(active_debounce.saturating_sub(t.elapsed()));
         }
-        if let Some(t) = last_cursor_change_at {
+        // Wake exactly when the nav-settle window elapses so dispatch
+        // kicks in on key-up without waiting for the next TICK.
+        if let Some(t) = nav.last_input_at {
             let remaining = NAV_SETTLE.saturating_sub(t.elapsed());
             if !remaining.is_zero() {
                 timeout = timeout.min(remaining);
@@ -425,7 +475,7 @@ pub fn run(app: &mut App, disk_cache: DiskCache) -> Result<()> {
                 let Ok(ev) = ev else { break; };
                 if let Event::Key(key) = ev
                     && key.kind == KeyEventKind::Press
-                    && handle_key(app, key, &save_tx) == Action::Quit
+                    && process_key(app, key, &save_tx, &mut nav) == Action::Quit
                 {
                     if pending_develop_change(app) {
                         flush_pending_develop(app, &save_tx, now_unix());
@@ -440,6 +490,7 @@ pub fn run(app: &mut App, disk_cache: DiskCache) -> Result<()> {
                     &mut mem_cache,
                     &save_tx,
                     &picker,
+                    is_tmux,
                     app,
                     &latest_generation,
                     &mut prefetch_cancels,
@@ -454,6 +505,13 @@ pub fn run(app: &mut App, disk_cache: DiskCache) -> Result<()> {
             }
             default(timeout) => {}
         }
+    }
+
+    // Free terminal-side image storage (kitty graphics) for everything we
+    // had cached so we don't leave a session's worth of orphaned images on
+    // the terminal after we exit.
+    for (_, entry) in mem_cache.iter() {
+        release_terminal_image(entry, &picker, is_tmux);
     }
 
     // Shutdown discipline: drop the worker channels so the develop thread
@@ -500,6 +558,7 @@ fn flush_pending_develop(app: &mut App, save_tx: &Sender<SaveMsg>, now: i64) {
 fn install_in_memory(
     mem_cache: &mut LruCache<PathBuf, PreviewEntry>,
     picker: &Picker,
+    is_tmux: bool,
     path: &Path,
     target: TargetSize,
     params_fp: u64,
@@ -515,7 +574,18 @@ fn install_in_memory(
             rendered_target: target,
             params_fingerprint: params_fp,
         };
-        mem_cache.put(path.to_path_buf(), entry);
+        // Replace any prior protocol for the same path (otherwise its kitty
+        // image data leaks on the terminal side until LRU eviction).
+        if let Some(prev) = mem_cache.pop(path) {
+            release_terminal_image(&prev, picker, is_tmux);
+        }
+        // `push` (vs `put`) returns the LRU-evicted entry so we can free its
+        // terminal-side resources. Without this, kitty's graphics quota fills
+        // and the terminal evicts images whose unicode placeholders we still
+        // emit, leaving the preview pane blank.
+        if let Some((_, evicted)) = mem_cache.push(path.to_path_buf(), entry) {
+            release_terminal_image(&evicted, picker, is_tmux);
+        }
         if app
             .status
             .as_deref()
@@ -528,6 +598,48 @@ fn install_in_memory(
     }
 }
 
+/// Mirror of `ratatui_image::picker::detect_tmux_and_outer_protocol_from_env`
+/// since `Picker` doesn't expose its `is_tmux` flag. Used so the kitty delete
+/// escape we emit on cache eviction is wrapped the same way the transmit was.
+fn detect_is_tmux() -> bool {
+    std::env::var("TERM").is_ok_and(|t| t.starts_with("tmux"))
+        || std::env::var("TERM_PROGRAM").is_ok_and(|t| t == "tmux")
+}
+
+/// Free the terminal-side resources backing a `PreviewEntry` we are about to
+/// drop. Only the kitty unicode-placeholder backend has terminal-side state
+/// (an image transmitted under a 32-bit id, referenced later by placeholder
+/// cells); sixel / iterm2 / halfblocks carry pixels inline per render and
+/// have nothing to release. Without this, kitty/Ghostty/WezTerm hit their
+/// graphics-storage quota after a few hundred previews and start evicting
+/// images that are still referenced by our cache, which surfaces as a black
+/// preview pane.
+fn release_terminal_image(entry: &PreviewEntry, picker: &Picker, is_tmux: bool) {
+    use std::fmt::Write as _;
+    use std::io::Write as _;
+
+    if picker.protocol_type() != ProtocolType::Kitty {
+        return;
+    }
+    let StatefulProtocol::Kitty(ref k) = entry.proto else {
+        return;
+    };
+    let id = k.unique_id;
+
+    let (start, escape, end) = CapParser::escape_tmux(is_tmux);
+    let mut seq = String::with_capacity(48);
+    seq.push_str(start);
+    seq.push_str(escape);
+    let _ = write!(seq, "_Ga=d,d=I,i={id};");
+    seq.push_str(escape);
+    seq.push('\\');
+    seq.push_str(end);
+
+    let mut stdout = io::stdout().lock();
+    let _ = stdout.write_all(seq.as_bytes());
+    let _ = stdout.flush();
+}
+
 /// Result of [`drain_input_events`]: whether the loop should keep going or
 /// exit because the user pressed quit.
 #[derive(PartialEq, Eq)]
@@ -536,22 +648,124 @@ enum EventDrain {
     Quit,
 }
 
+/// State for rate-limiting held-key navigation. While the user holds j/k the
+/// OS emits a key-repeat burst at ~30 Hz; without this we'd scrub the cursor
+/// through 30 files per second and image dispatch would chase a moving
+/// target. The policy:
+///  1. The first press of a tap or fresh burst advances immediately.
+///  2. While the burst continues (same key, gaps < `NAV_BURST_GAP`), advances
+///     are rate-limited to `NAV_SLOW_INTERVAL` (5 Hz) for the first
+///     `NAV_RAMP_DURATION` so the user can read what's scrolling past.
+///  3. After the ramp, advances run at the full incoming event rate.
+///  4. Image dispatch is gated on `last_input_at`, not `last_advance_at`, so
+///     no preview decode kicks off until the user releases the key
+///     (detected as `NAV_SETTLE` of input silence).
+#[derive(Default)]
+struct NavCoalesce {
+    /// Timestamp of the most recent nav key event we received, advance or
+    /// not. Drives "user has released the key" detection.
+    last_input_at: Option<Instant>,
+    /// Direction of the most recent nav key, for is-this-a-continuation.
+    last_key: Option<KeyCode>,
+    /// When the current burst started — needed to switch from slow to fast
+    /// once `NAV_RAMP_DURATION` has passed.
+    burst_started_at: Option<Instant>,
+    /// When we last actually advanced the cursor — drives the slow-phase
+    /// rate limit.
+    last_advance_at: Option<Instant>,
+}
+
 /// Apply every queued input event without blocking. Returns [`EventDrain::Quit`]
 /// if any handler signaled quit (caller is responsible for the flush + break).
 fn drain_input_events(
     app: &mut App,
     event_rx: &Receiver<Event>,
     save_tx: &Sender<SaveMsg>,
+    nav: &mut NavCoalesce,
 ) -> EventDrain {
     while let Ok(ev) = event_rx.try_recv() {
         if let Event::Key(key) = ev
             && key.kind == KeyEventKind::Press
-            && handle_key(app, key, save_tx) == Action::Quit
+            && process_key(app, key, save_tx, nav) == Action::Quit
         {
             return EventDrain::Quit;
         }
     }
     EventDrain::Continue
+}
+
+/// Route a Press key event: navigation keys go through the coalescer first;
+/// everything else hits `handle_key` as before.
+fn process_key(
+    app: &mut App,
+    key: KeyEvent,
+    save_tx: &Sender<SaveMsg>,
+    nav: &mut NavCoalesce,
+) -> Action {
+    if try_coalesce_nav(app, key, save_tx, nav) {
+        return Action::Continue;
+    }
+    handle_key(app, key, save_tx)
+}
+
+/// Returns true if `key` was a navigation key in Navigation focus and was
+/// handled by the coalescer. Otherwise the caller falls through to `handle_key`.
+fn try_coalesce_nav(
+    app: &mut App,
+    key: KeyEvent,
+    save_tx: &Sender<SaveMsg>,
+    nav: &mut NavCoalesce,
+) -> bool {
+    if app.view != View::Main || app.focus != Focus::Navigation {
+        return false;
+    }
+    let delta: i32 = match key.code {
+        KeyCode::Char('j') | KeyCode::Down => 1,
+        KeyCode::Char('k') | KeyCode::Up => -1,
+        _ => return false,
+    };
+    let now = Instant::now();
+    let in_burst = nav
+        .last_input_at
+        .map(|t| now.duration_since(t) < NAV_BURST_GAP)
+        .unwrap_or(false)
+        && nav.last_key == Some(key.code);
+
+    let should_advance = if in_burst {
+        // Mid-burst: rate-limit. Slow phase for the first NAV_RAMP_DURATION,
+        // then full speed.
+        let burst_elapsed = nav
+            .burst_started_at
+            .map(|t| now.duration_since(t))
+            .unwrap_or(Duration::ZERO);
+        let interval = if burst_elapsed < NAV_RAMP_DURATION {
+            NAV_SLOW_INTERVAL
+        } else {
+            Duration::ZERO
+        };
+        nav.last_advance_at
+            .map(|t| now.duration_since(t) >= interval)
+            .unwrap_or(true)
+    } else {
+        // Fresh tap / new direction / gap longer than auto-repeat: this is
+        // the start of a new burst. Always advance the first event.
+        nav.burst_started_at = Some(now);
+        true
+    };
+
+    if should_advance {
+        flush_pending_develop(app, save_tx, now_unix());
+        if delta > 0 {
+            app.next();
+        } else {
+            app.prev();
+        }
+        nav.last_advance_at = Some(now);
+    }
+
+    nav.last_input_at = Some(now);
+    nav.last_key = Some(key.code);
+    true
 }
 
 /// Spawn the save worker. Owns its own `Db` connection and a clone of the
@@ -774,6 +988,7 @@ fn handle_job_done(
     mem_cache: &mut LruCache<PathBuf, PreviewEntry>,
     save_tx: &Sender<SaveMsg>,
     picker: &Picker,
+    is_tmux: bool,
     app: &mut App,
     latest_generation: &HashMap<PathBuf, u64>,
     prefetch_cancels: &mut HashMap<PathBuf, Arc<AtomicBool>>,
@@ -807,6 +1022,7 @@ fn handle_job_done(
             install_in_memory(
                 mem_cache,
                 picker,
+                is_tmux,
                 &done.path,
                 done.target,
                 done.params_fingerprint,
@@ -896,6 +1112,7 @@ fn draw(
     frame: &mut ratatui::Frame,
     app: &mut App,
     mem_cache: &mut LruCache<PathBuf, PreviewEntry>,
+    displayed_path: Option<&Path>,
     font_size: (u16, u16),
 ) {
     let area = frame.area();
@@ -917,7 +1134,7 @@ fn draw(
     ])
     .areas(main_area);
 
-    preview::render(frame, app, mem_cache, preview_area, font_size);
+    preview::render(frame, app, mem_cache, displayed_path, preview_area, font_size);
     develop::render(frame, app, develop_area);
     info::render(frame, app, info_area);
     filmstrip::render(frame, app, filmstrip_area);
