@@ -48,7 +48,11 @@ const DEBOUNCE_COLD: Duration = Duration::from_millis(250);
 /// Debounce when the worker has the active source cached. Drops to a value
 /// just above typical key-repeat (~30 ms) so knob ticks feel real-time.
 const DEBOUNCE_HOT: Duration = Duration::from_millis(50);
-const PREVIEW_CACHE_CAP: usize = 9;
+/// Capacity of the rendered-preview LRU. Bumped from 9 → 15 to comfortably
+/// hold the active preview, prefetched cursor±1, and recent history under
+/// fast scrolling without churn. Each entry is a `StatefulProtocol`, not a
+/// raw f32 buffer, so the memory cost is modest.
+const PREVIEW_CACHE_CAP: usize = 15;
 /// Capacity of the worker-side prepared-source cache. Each entry holds a
 /// target-sized `Buffer<CameraLinear>` (~18-36 MB at typical preview sizes).
 const SOURCE_CACHE_CAP: usize = 3;
@@ -65,6 +69,15 @@ pub(crate) struct PreviewEntry {
     pub(crate) params_fingerprint: u64,
 }
 
+/// Foreground (active selection) vs. prefetch (cursor±1 warm-up). The kind
+/// flows from `Job` into `JobDone` so the main thread knows whether to
+/// validate against `latest_generation` (fg) or just install if Ok (prefetch).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JobKind {
+    Foreground,
+    Prefetch,
+}
+
 struct Job {
     path: PathBuf,
     target: TargetSize,
@@ -74,6 +87,7 @@ struct Job {
     params_fingerprint: u64,
     source_fp: u64,
     size_bytes: u64,
+    kind: JobKind,
 }
 
 struct JobDone {
@@ -84,6 +98,7 @@ struct JobDone {
     source_fp: u64,
     result: std::result::Result<Srgb8, DevelopError>,
     meta: Option<FileMeta>,
+    kind: JobKind,
 }
 
 /// Persistence work routed to the save worker. The worker owns its own `Db`
@@ -181,6 +196,7 @@ pub fn run(app: &mut App, disk_cache: DiskCache) -> Result<()> {
     // because the channel is full just means the most recent dispatch
     // already covers the latest selection.
     let (job_tx, job_rx) = crossbeam_channel::bounded::<Job>(1);
+    let (prefetch_tx, prefetch_rx) = crossbeam_channel::bounded::<Job>(2);
     let (done_tx, done_rx) = crossbeam_channel::unbounded::<JobDone>();
     let (event_tx, event_rx) = crossbeam_channel::unbounded::<Event>();
     let (cache_tx, cache_rx) = crossbeam_channel::unbounded::<CacheEvent>();
@@ -193,7 +209,7 @@ pub fn run(app: &mut App, disk_cache: DiskCache) -> Result<()> {
     let save_handle = spawn_save_worker(save_rx, save_db, disk_cache.clone());
 
     spawn_event_thread(event_tx);
-    spawn_worker(job_rx, done_tx, cache_tx);
+    spawn_worker(job_rx, prefetch_rx, done_tx, cache_tx);
 
     let mut mem_cache: LruCache<PathBuf, PreviewEntry> =
         LruCache::new(NonZeroUsize::new(PREVIEW_CACHE_CAP).unwrap());
@@ -208,6 +224,10 @@ pub fn run(app: &mut App, disk_cache: DiskCache) -> Result<()> {
     // Paths the worker currently has prepared in its source cache. Drives
     // the tiered debounce: hot paths get DEBOUNCE_HOT, cold get DEBOUNCE_COLD.
     let mut hot_paths: HashSet<PathBuf> = HashSet::new();
+    // Active prefetch jobs keyed by path. Each Arc<AtomicBool> is the cancel
+    // flag for that job; we flip it when the path falls outside the cursor±1
+    // window. Removed when the matching JobDone arrives or on cancellation.
+    let mut prefetch_cancels: HashMap<PathBuf, Arc<AtomicBool>> = HashMap::new();
 
     loop {
         // 0. Drain all queued input events first. With OS key-repeat at
@@ -312,6 +332,7 @@ pub fn run(app: &mut App, disk_cache: DiskCache) -> Result<()> {
                             params_fingerprint: rfp,
                             source_fp: src_fp,
                             size_bytes: size_now,
+                            kind: JobKind::Foreground,
                         });
                     }
                 }
@@ -320,6 +341,17 @@ pub fn run(app: &mut App, disk_cache: DiskCache) -> Result<()> {
                 last_id = current_id;
                 last_rendered_fp = render_fp;
             }
+
+            // After the foreground dispatch, prune stale prefetch jobs and
+            // queue prefetches for cursor±1 (best-effort; the worker drains
+            // foreground first).
+            update_prefetch(
+                app,
+                target,
+                &mem_cache,
+                &mut prefetch_cancels,
+                &prefetch_tx,
+            );
         } else if selection_changed {
             // No current selection (empty list) — clear tracking.
             last_id = current_id;
@@ -366,6 +398,7 @@ pub fn run(app: &mut App, disk_cache: DiskCache) -> Result<()> {
                     &picker,
                     app,
                     &latest_generation,
+                    &mut prefetch_cancels,
                 );
             }
             recv(cache_rx) -> ev => {
@@ -379,11 +412,12 @@ pub fn run(app: &mut App, disk_cache: DiskCache) -> Result<()> {
         }
     }
 
-    // Shutdown discipline: drop the worker channel so the develop thread
+    // Shutdown discipline: drop the worker channels so the develop thread
     // exits, then drop the save channel and join the save worker so any
     // pending DB writes / disk-cache blobs land before the alternate-screen
     // guard tears down.
     drop(job_tx);
+    drop(prefetch_tx);
     drop(save_tx);
     let _ = save_handle.join();
     Ok(())
@@ -523,123 +557,151 @@ fn spawn_event_thread(tx: Sender<Event>) {
     });
 }
 
-fn spawn_worker(rx: Receiver<Job>, tx: Sender<JobDone>, cache_tx: Sender<CacheEvent>) {
+fn spawn_worker(
+    fg_rx: Receiver<Job>,
+    prefetch_rx: Receiver<Job>,
+    tx: Sender<JobDone>,
+    cache_tx: Sender<CacheEvent>,
+) {
     thread::spawn(move || {
         let mut source_cache: LruCache<SourceKey, SourceEntry> =
             LruCache::new(NonZeroUsize::new(SOURCE_CACHE_CAP).unwrap());
-        while let Ok(job) = rx.recv() {
-            let Job {
-                path,
-                target,
-                cancel,
-                generation,
-                params,
-                params_fingerprint,
-                source_fp,
-                size_bytes,
-            } = job;
-
-            if cancel.load(Ordering::Relaxed) {
-                if tx
-                    .send(JobDone {
-                        path,
-                        generation,
-                        target,
-                        params_fingerprint,
-                        source_fp,
-                        result: Err(DevelopError::Cancelled),
-                        meta: None,
-                    })
-                    .is_err()
-                {
-                    break;
+        loop {
+            // Drain foreground queue first. Prefetch is best-effort and only
+            // runs when the user is idle (no pending fg jobs).
+            while let Ok(job) = fg_rx.try_recv() {
+                if process_job(job, &mut source_cache, &tx, &cache_tx).is_err() {
+                    return;
                 }
-                continue;
             }
-
-            let key = SourceKey {
-                path: path.clone(),
-                source_fp,
-                target_bucket: target_bucket(target),
-            };
-
-            // Cache hit: skip decode + resize entirely.
-            let (prepared, meta) = if let Some(entry) = source_cache.get(&key) {
-                (entry.prepared.clone(), Some(entry.meta.clone()))
-            } else {
-                match decode(&path) {
-                    Ok(loaded) => {
-                        let meta = file_meta_from(&loaded, size_bytes);
-                        match prepare_source(&loaded, target, Some(&cancel)) {
-                            Ok(prep) => {
-                                let prepared = Arc::new(prep);
-                                let entry = SourceEntry {
-                                    prepared: prepared.clone(),
-                                    meta: meta.clone(),
-                                };
-                                if let Some((evicted_key, _)) = source_cache.push(key, entry) {
-                                    let _ = cache_tx
-                                        .send(CacheEvent::Evicted(evicted_key.path));
-                                }
-                                let _ = cache_tx.send(CacheEvent::Cached(path.clone()));
-                                (prepared, Some(meta))
-                            }
-                            Err(e) => {
-                                if tx
-                                    .send(JobDone {
-                                        path,
-                                        generation,
-                                        target,
-                                        params_fingerprint,
-                                        source_fp,
-                                        result: Err(e),
-                                        meta: Some(meta),
-                                    })
-                                    .is_err()
-                                {
-                                    break;
-                                }
-                                continue;
-                            }
+            // Block on either channel. If either disconnects, shut down.
+            select! {
+                recv(fg_rx) -> j => match j {
+                    Ok(job) => {
+                        if process_job(job, &mut source_cache, &tx, &cache_tx).is_err() {
+                            return;
                         }
                     }
+                    Err(_) => return,
+                },
+                recv(prefetch_rx) -> j => match j {
+                    Ok(job) => {
+                        if process_job(job, &mut source_cache, &tx, &cache_tx).is_err() {
+                            return;
+                        }
+                    }
+                    Err(_) => return,
+                },
+            }
+        }
+    });
+}
+
+/// Run a single develop job through the (cached) prepare → apply pipeline.
+/// Returns `Err(())` only when the JobDone channel is closed (shutdown).
+fn process_job(
+    job: Job,
+    source_cache: &mut LruCache<SourceKey, SourceEntry>,
+    tx: &Sender<JobDone>,
+    cache_tx: &Sender<CacheEvent>,
+) -> std::result::Result<(), ()> {
+    let Job {
+        path,
+        target,
+        cancel,
+        generation,
+        params,
+        params_fingerprint,
+        source_fp,
+        size_bytes,
+        kind,
+    } = job;
+
+    if cancel.load(Ordering::Relaxed) {
+        return tx
+            .send(JobDone {
+                path,
+                generation,
+                target,
+                params_fingerprint,
+                source_fp,
+                result: Err(DevelopError::Cancelled),
+                meta: None,
+                kind,
+            })
+            .map_err(|_| ());
+    }
+
+    let key = SourceKey {
+        path: path.clone(),
+        source_fp,
+        target_bucket: target_bucket(target),
+    };
+
+    let (prepared, meta) = if let Some(entry) = source_cache.get(&key) {
+        (entry.prepared.clone(), Some(entry.meta.clone()))
+    } else {
+        match decode(&path) {
+            Ok(loaded) => {
+                let meta = file_meta_from(&loaded, size_bytes);
+                match prepare_source(&loaded, target, Some(&cancel)) {
+                    Ok(prep) => {
+                        let prepared = Arc::new(prep);
+                        let entry = SourceEntry {
+                            prepared: prepared.clone(),
+                            meta: meta.clone(),
+                        };
+                        if let Some((evicted_key, _)) = source_cache.push(key, entry) {
+                            let _ = cache_tx.send(CacheEvent::Evicted(evicted_key.path));
+                        }
+                        let _ = cache_tx.send(CacheEvent::Cached(path.clone()));
+                        (prepared, Some(meta))
+                    }
                     Err(e) => {
-                        if tx
+                        return tx
                             .send(JobDone {
                                 path,
                                 generation,
                                 target,
                                 params_fingerprint,
                                 source_fp,
-                                result: Err(DevelopError::Decode(e)),
-                                meta: None,
+                                result: Err(e),
+                                meta: Some(meta),
+                                kind,
                             })
-                            .is_err()
-                        {
-                            break;
-                        }
-                        continue;
+                            .map_err(|_| ());
                     }
                 }
-            };
-
-            let result = apply_pipeline(&prepared, &params, Some(&cancel));
-            if tx
-                .send(JobDone {
-                    path,
-                    generation,
-                    target,
-                    params_fingerprint,
-                    source_fp,
-                    result,
-                    meta,
-                })
-                .is_err()
-            {
-                break;
+            }
+            Err(e) => {
+                return tx
+                    .send(JobDone {
+                        path,
+                        generation,
+                        target,
+                        params_fingerprint,
+                        source_fp,
+                        result: Err(DevelopError::Decode(e)),
+                        meta: None,
+                        kind,
+                    })
+                    .map_err(|_| ());
             }
         }
-    });
+    };
+
+    let result = apply_pipeline(&prepared, &params, Some(&cancel));
+    tx.send(JobDone {
+        path,
+        generation,
+        target,
+        params_fingerprint,
+        source_fp,
+        result,
+        meta,
+        kind,
+    })
+    .map_err(|_| ())
 }
 
 fn file_meta_from(loaded: &Loaded, size_bytes: u64) -> FileMeta {
@@ -670,8 +732,15 @@ fn handle_job_done(
     picker: &Picker,
     app: &mut App,
     latest_generation: &HashMap<PathBuf, u64>,
+    prefetch_cancels: &mut HashMap<PathBuf, Arc<AtomicBool>>,
 ) {
-    if latest_generation.get(&done.path).copied() != Some(done.generation) {
+    let is_prefetch = done.kind == JobKind::Prefetch;
+
+    if is_prefetch {
+        // The cancel flag for this prefetch is still in the map; remove it
+        // now that the job has reported back (Ok or Err).
+        prefetch_cancels.remove(&done.path);
+    } else if latest_generation.get(&done.path).copied() != Some(done.generation) {
         return;
     }
 
@@ -682,9 +751,8 @@ fn handle_job_done(
     match done.result {
         Ok(rgb) => {
             // Update the in-memory cache first so the screen refreshes
-            // immediately. The on-disk write is shipped to the save worker
-            // (which owns its own Db connection), so we don't pay for
-            // fs::sync_all on the UI thread.
+            // immediately (or so a future selection finds the warm entry).
+            // The on-disk write is shipped to the save worker.
             let blob = SaveMsg::CacheBlob {
                 path: done.path.clone(),
                 source_fp: done.source_fp,
@@ -705,8 +773,78 @@ fn handle_job_done(
         }
         Err(DevelopError::Cancelled) => {}
         Err(e) => {
-            app.status = Some(format!("preview error: {e}"));
+            // Don't surface prefetch errors to the user — they're best-effort.
+            if !is_prefetch {
+                app.status = Some(format!("preview error: {e}"));
+            }
         }
+    }
+}
+
+/// Maintain the prefetch window around the cursor: cancel + drop any
+/// in-flight prefetch whose path is no longer cursor±1, and queue prefetch
+/// jobs for cursor-1 / cursor+1 if they're not already in mem_cache or
+/// already pending. Best-effort: bounded(2) with try_send means the worker
+/// can refuse a third candidate, which is fine — the next call retries.
+fn update_prefetch(
+    app: &App,
+    target: TargetSize,
+    mem_cache: &LruCache<PathBuf, PreviewEntry>,
+    prefetch_cancels: &mut HashMap<PathBuf, Arc<AtomicBool>>,
+    prefetch_tx: &Sender<Job>,
+) {
+    let cursor = app.cursor;
+    let visible = &app.visible;
+
+    // Compute the window: cursor-1 and cursor+1 (if they exist).
+    let mut window: Vec<usize> = Vec::with_capacity(2);
+    if cursor > 0 {
+        if let Some(&i) = visible.get(cursor - 1) {
+            window.push(i);
+        }
+    }
+    if let Some(&i) = visible.get(cursor + 1) {
+        window.push(i);
+    }
+    let window_paths: HashSet<&PathBuf> = window
+        .iter()
+        .map(|&i| &app.files[i].file.canonical_path)
+        .collect();
+
+    // Cancel any prefetches that have fallen outside the window.
+    prefetch_cancels.retain(|path, cancel| {
+        if window_paths.contains(path) {
+            true
+        } else {
+            cancel.store(true, Ordering::Relaxed);
+            false
+        }
+    });
+
+    // Queue new prefetches for window slots that aren't already cached or
+    // already in flight.
+    for idx in window {
+        let entry = &app.files[idx];
+        let path = &entry.file.canonical_path;
+        if mem_cache.contains(path) {
+            continue;
+        }
+        if prefetch_cancels.contains_key(path) {
+            continue;
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        prefetch_cancels.insert(path.clone(), cancel.clone());
+        let _ = prefetch_tx.try_send(Job {
+            path: path.clone(),
+            target,
+            cancel,
+            generation: 0, // unused for prefetch
+            params: entry.develop_params.clone(),
+            params_fingerprint: entry.develop_params_fp,
+            source_fp: entry.source_fp,
+            size_bytes: entry.file.size_bytes,
+            kind: JobKind::Prefetch,
+        });
     }
 }
 
